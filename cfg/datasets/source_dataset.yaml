@@ -1,0 +1,12 @@
+path: /root/autodl-tmp/v8-bytetrack/yolov8/datasets/soda10m
+train: images/train
+val: images/val
+test:
+# Classes
+names:
+  0: Pedestrain
+  1: Cyclist
+  2: Car
+  3: Truck
+  4: Tram
+  5: Tricycle
