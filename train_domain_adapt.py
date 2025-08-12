@@ -1,9 +1,9 @@
-from ultralytics import YOLO
-import torch
+
 import argparse
-import os
+
 from domain_adapt_trainer import DomainAdaptTrainer
-from ultralytics.utils import DEFAULT_CFG  # 导入默认配置
+from ultralytics.cfg import get_cfg
+from ultralytics.utils import DEFAULT_CFG
 
 
 def parse_args():
@@ -39,9 +39,11 @@ def main():
 
     if args.weights:
         train_args['weights'] = args.weights
+    # 创建cfg对象
+    cfg = get_cfg(DEFAULT_CFG, {})  # 创建一个空的配置
 
     # 创建并初始化域适应训练器
-    trainer = DomainAdaptTrainer(overrides=train_args)
+    trainer = DomainAdaptTrainer(cfg=cfg,overrides=train_args)
 
     # 单独设置域适应特定参数
     trainer.setup_domain_adaptation(
