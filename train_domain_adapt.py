@@ -15,7 +15,7 @@ def parse_args():
     parser.add_argument('--batch-size', type=int, default=16, help='batch size')
     parser.add_argument('--imgsz', type=int, default=640, help='image size')
     parser.add_argument('--lr0', type=float, default=0.01, help='initial learning rate')
-    parser.add_argument('--lr0-d', type=float, default=0.001, help='initial discriminator learning rate')
+    parser.add_argument('--disc-lr', type=float, default=0.001, help='initial discriminator learning rate')
     parser.add_argument('--weights', type=str, default=None, help='initial weights path')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--save-period', type=int, default=10, help='Save checkpoint every x epochs')
@@ -25,32 +25,31 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Create combined data dictionary with source and target domains
-    data = {
-        'source_domain': args.source_data,
-        'target_domain': args.target_data
-    }
-
-    # Configure training arguments
+    # 标准YOLOv8参数 - 只使用官方支持的参数
     train_args = {
         'model': args.cfg,
-        'data': data,
+        'data': args.source_data,  # 使用源域数据作为主要训练数据
         'epochs': args.epochs,
         'batch': args.batch_size,
         'imgsz': args.imgsz,
         'lr0': args.lr0,
-        'lr0_d': args.lr0_d,
         'device': args.device,
-        'source_domain': 'source_domain',
-        'target_domain': 'target_domain',
         'save_period': args.save_period
     }
 
     if args.weights:
         train_args['weights'] = args.weights
 
-    # Initialize and run domain adaptation trainer
-    trainer = DomainAdaptTrainer(cfg=DEFAULT_CFG,overrides=train_args)
+    # 创建并初始化域适应训练器
+    trainer = DomainAdaptTrainer(overrides=train_args)
+
+    # 单独设置域适应特定参数
+    trainer.setup_domain_adaptation(
+        target_data=args.target_data,
+        disc_lr=args.disc_lr
+    )
+
+    # 开始训练
     trainer.train()
 
 
