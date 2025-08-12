@@ -3,6 +3,7 @@ import torch
 import argparse
 import os
 from domain_adapt_trainer import DomainAdaptTrainer
+from ultralytics.utils import DEFAULT_CFG  # 导入默认配置
 
 
 def parse_args():
@@ -49,7 +50,7 @@ def main():
         train_args['weights'] = args.weights
 
     # Initialize and run domain adaptation trainer
-    trainer = DomainAdaptTrainer(overrides=train_args)
+    trainer = DomainAdaptTrainer(cfg=DEFAULT_CFG,overrides=train_args)
     trainer.train()
 
 
