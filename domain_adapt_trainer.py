@@ -14,12 +14,13 @@ from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.utils.torch_utils import de_parallel
 from ultralytics.utils import LOGGER, RANK
 from ultralytics.nn.tasks import DetectionModel
+from ultralytics.models.yolo.detect import DetectionTrainer
 
 from trans_discriminator import TransformerDiscriminator
 from feature_extractor import FeatureExtractor
 
 
-class DomainAdaptTrainer(yolo.detect.DetectionTrainer):
+class DomainAdaptTrainer(DetectionTrainer):
     """
     Domain Adaptation Trainer for YOLOv8 object detection.
 
