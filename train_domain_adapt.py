@@ -7,9 +7,9 @@ from domain_adapt_trainer import DomainAdaptTrainer
 
 def parse_args():
     parser = argparse.ArgumentParser(description='YOLOv8 Domain Adaptation Training')
-    parser.add_argument('--cfg', type=str, default='yolov8-translayer.yaml', help='model.yaml path')
-    parser.add_argument('--source-data', type=str, required=True, help='source domain dataset.yaml path')
-    parser.add_argument('--target-data', type=str, required=True, help='target domain dataset.yaml path')
+    parser.add_argument('--cfg', type=str, default='ultralytics/cfg/models/yolov8-translayer.yaml', help='model.yaml path')
+    parser.add_argument('--source-data', type=str, default='/root/autodl-tmp/v8-bytetrack/yolov8/ultralytics/cfg/datasets/source_dataset.yaml', help='source domain dataset.yaml path')
+    parser.add_argument('--target-data', type=str, default='/root/autodl-tmp/v8-bytetrack/yolov8/ultralytics/cfg/datasets/target_dataset.yaml', help='target domain dataset.yaml path')
     parser.add_argument('--epochs', type=int, default=100, help='number of epochs')
     parser.add_argument('--batch-size', type=int, default=16, help='batch size')
     parser.add_argument('--imgsz', type=int, default=640, help='image size')
