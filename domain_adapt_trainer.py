@@ -16,7 +16,6 @@ from ultralytics.utils import LOGGER, RANK
 from ultralytics.nn.tasks import DetectionModel
 
 from trans_discriminator import TransformerDiscriminator
-
 from feature_extractor import FeatureExtractor
 
 
