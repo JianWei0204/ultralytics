@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import time
 import os
 import yaml
+from torch.utils.data import DataLoader
 
 from ultralytics.utils import LOGGER, RANK
 from ultralytics.utils.torch_utils import de_parallel
@@ -18,22 +19,16 @@ from feature_extractor import FeatureExtractor
 class DomainAdaptTrainer(DetectionTrainer):
     """
     Domain Adaptation Trainer for YOLOv8 object detection.
-
-    This trainer extends the standard YOLOv8 DetectionTrainer to support
-    unsupervised domain adaptation using a transformer-based discriminator.
     """
 
     def __init__(self, cfg=None, overrides=None, _callbacks=None):
         # 仅使用标准YOLOv8参数初始化
         super().__init__(cfg, overrides, _callbacks)
 
-        # 初始化域适应组件和参数（由setup_domain_adaptation方法设置）
-        self.source_data = None
+        # 初始化域适应组件和参数
         self.target_data = None
-        self.source_dataset = None
         self.target_dataset = None
         self.target_loader = None
-        self.source_loader = None
         self.disc_lr = 0.001  # 默认判别器学习率
 
         # 源域和目标域标签
@@ -44,8 +39,6 @@ class DomainAdaptTrainer(DetectionTrainer):
         self.discriminator = None
         self.optimizer_D = None
         self.feature_extractor = None
-
-        # 标记是否启用域适应
         self.domain_adapt_enabled = False
 
     def setup_domain_adaptation(self, target_data, disc_lr=0.001):
@@ -56,8 +49,6 @@ class DomainAdaptTrainer(DetectionTrainer):
 
         LOGGER.info(f"Domain adaptation enabled with target data: {self.target_data}")
         LOGGER.info(f"Discriminator learning rate set to: {self.disc_lr}")
-
-        # 如果目标域数据集需要在这里加载，可以在这里添加代码
 
     def _setup_train(self, world_size):
         """设置训练与域适应组件"""
@@ -94,28 +85,53 @@ class DomainAdaptTrainer(DetectionTrainer):
                 # 检查路径是否存在
                 if not os.path.exists(target_img_path):
                     raise FileNotFoundError(f"Target domain path does not exist: {target_img_path}")
+
+                # 创建目标域数据集
+                self.target_dataset = self.build_dataset(
+                    img_path=target_img_path,
+                    mode="train",
+                    batch=self.args.batch
+                )
+
+                # 直接创建DataLoader
+                batch_size = self.batch_size // max(world_size, 1)
+                nw = min([os.cpu_count() // max(world_size, 1), self.args.workers, 8])
+                collate_fn = self.target_dataset.collate_fn
+
+                if RANK == -1:
+                    # 非分布式训练
+                    self.target_loader = DataLoader(
+                        dataset=self.target_dataset,
+                        batch_size=batch_size,
+                        shuffle=True,
+                        num_workers=nw,
+                        collate_fn=collate_fn,
+                        pin_memory=True,
+                        drop_last=True,  # 丢弃最后不完整的批次
+                    )
+                else:
+                    # 分布式训练
+                    sampler = torch.utils.data.distributed.DistributedSampler(
+                        self.target_dataset, shuffle=True
+                    )
+                    self.target_loader = DataLoader(
+                        dataset=self.target_dataset,
+                        batch_size=batch_size,
+                        sampler=sampler,
+                        num_workers=nw,
+                        collate_fn=collate_fn,
+                        pin_memory=True,
+                        drop_last=True,
+                    )
+
+                # 初始化判别器及其优化器
+                self.setup_discriminator()
+
+                LOGGER.info(f"Target domain dataloader created with {len(self.target_loader)} batches")
+
             except Exception as e:
                 LOGGER.error(f"Error loading target domain dataset: {e}")
                 raise
-
-            self.target_dataset = self.build_dataset(
-                img_path=target_img_path, # 使用完整路径
-                mode="train",
-                batch=self.args.batch
-            )
-
-            batch_size = self.batch_size // max(world_size, 1)
-            self.target_loader = self.get_dataloader(
-                self.target_dataset,
-                batch_size=batch_size,
-                rank=RANK,
-                mode="train"
-            )
-
-            # 初始化判别器及其优化器
-            self.setup_discriminator()
-
-            LOGGER.info(f"Target domain dataloader created with {len(self.target_loader)} batches")
 
     def setup_discriminator(self):
         """初始化域判别器及其优化器"""
