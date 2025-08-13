@@ -535,9 +535,19 @@ class DomainAdaptTrainer(DetectionTrainer):
             # 处理每个epoch结束时的操作
             self.run_callbacks('on_train_epoch_end')
 
-            # 执行验证
-            if (epoch + 1) % self.args.val_interval == 0:
+            # 执行验证 - 添加错误处理
+            try:
+                val_interval = getattr(self.args, 'val_interval', 1)  # 如果不存在，默认为1
+                if (epoch + 1) % val_interval == 0:
+                    self.validate()
+            except AttributeError:
+                # 如果val_interval不存在，每个epoch都进行验证
+                LOGGER.warning("'val_interval' not found in configuration, using default value of 1")
                 self.validate()
+            except Exception as e:
+                LOGGER.error(f"Error during validation: {e}")
+                import traceback
+                LOGGER.error(traceback.format_exc())
 
             # 保存模型
             self.save_model()
