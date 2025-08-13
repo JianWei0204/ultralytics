@@ -141,7 +141,11 @@ class DomainAdaptTrainer(DetectionTrainer):
         # 创建判别器
         self.discriminator = TransformerDiscriminator(channels=feature_channels)
         self.discriminator.train()
-        self.discriminator.cuda()
+
+        # 检查是否有GPU可用
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        LOGGER.info(f"Using device: {device} for discriminator")
+        self.discriminator.to(device)
 
         if RANK != -1:
             self.discriminator = nn.parallel.DistributedDataParallel(
