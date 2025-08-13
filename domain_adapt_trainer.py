@@ -268,7 +268,8 @@ class DomainAdaptTrainer(DetectionTrainer):
         for epoch in range(self.start_epoch, self.epochs):
             # 确保设置为训练模式
             self.model.train()
-            self.discriminator.train()
+            if self.discriminator:
+                self.discriminator.train()
 
             # 更新学习率
             self.update_optimizer(epoch)
@@ -310,13 +311,24 @@ class DomainAdaptTrainer(DetectionTrainer):
 
                 # 使用compute_loss计算损失 - 添加异常处理
                 try:
+                    # 计算损失
                     self.loss, self.loss_items = self.compute_loss(preds, batch)
+
+                    # 显示损失形状与信息 (调试)
+                    if batch_idx == 0:
+                        LOGGER.info(f"Loss shape: {self.loss.shape}, requires_grad: {self.loss.requires_grad}")
+                        LOGGER.info(f"Loss items shape: {self.loss_items.shape}")
+
+                    # 检查损失是否为标量，如果不是，取平均值
+                    if self.loss.numel() > 1:
+                        LOGGER.warning(f"Loss is not scalar! Shape: {self.loss.shape}, taking mean.")
+                        self.loss = torch.mean(self.loss)
 
                     # 确保损失有梯度
                     if not self.loss.requires_grad:
                         LOGGER.warning("Loss does not require gradients! Creating a new loss tensor.")
                         dummy_param = next(self.model.parameters())
-                        self.loss = self.loss * 0 + dummy_param.sum() * 0 + 1.0
+                        self.loss = self.loss.detach() + dummy_param.sum() * 0
 
                 except Exception as e:
                     LOGGER.error(f"Error computing loss: {e}")
@@ -328,16 +340,33 @@ class DomainAdaptTrainer(DetectionTrainer):
                     self.loss = dummy_param.sum() * 0 + 1.0
                     self.loss_items = torch.ones(3, device=self.device)
 
-                # 标准反向传播与参数更新
+                # 标准反向传播与参数更新 - 使用try/except包装
                 try:
-                    self.scaler.scale(self.loss).backward()
+                    # 检查损失是否为标量
+                    if self.loss.numel() > 1:
+                        LOGGER.warning(f"Loss is still not scalar before backward! Shape: {self.loss.shape}")
+                        self.loss = torch.mean(self.loss)
+
+                    # 确保损失是标量
+                    assert self.loss.numel() == 1, f"Loss must be scalar for backward(), got shape {self.loss.shape}"
+
+                    # 安全反向传播
+                    if self.args.amp:
+                        with torch.cuda.amp.autocast():
+                            # 确保进行标量反向传播
+                            self.scaler.scale(self.loss).backward(retain_graph=True)
+                    else:
+                        self.loss.backward(retain_graph=True)
+
                 except Exception as e:
                     LOGGER.error(f"Error in backward pass: {e}")
+                    import traceback
+                    LOGGER.error(traceback.format_exc())
                     # 继续下一个批次
                     continue
 
-                    # 域对抗训练部分 --------------------
-                if (batch_idx + 1) % accumulate == 0:
+                # 域对抗训练部分 --------------------
+                if (batch_idx + 1) % accumulate == 0 and self.feature_extractor is not None:
                     try:
                         # 获取源域特征
                         source_features = self.feature_extractor.get_features()
@@ -346,7 +375,8 @@ class DomainAdaptTrainer(DetectionTrainer):
                             continue
 
                         # 打印源域特征形状以便调试
-                        LOGGER.info(f"Source domain features shape: {source_features.shape}")
+                        if batch_idx % 10 == 0:
+                            LOGGER.info(f"Source domain features shape: {source_features.shape}")
 
                         # 获取目标域数据
                         try:
@@ -369,7 +399,8 @@ class DomainAdaptTrainer(DetectionTrainer):
                             continue
 
                         # 打印目标域特征形状以便调试
-                        LOGGER.info(f"Target domain features shape: {target_features.shape}")
+                        if batch_idx % 10 == 0:
+                            LOGGER.info(f"Target domain features shape: {target_features.shape}")
 
                         # 判别器训练 - 源域 (给定标签0)
                         self.optimizer_D.zero_grad()
@@ -380,8 +411,9 @@ class DomainAdaptTrainer(DetectionTrainer):
                             self.device)
 
                         # 打印判别器输出和标签形状
-                        LOGGER.info(
-                            f"D_out_source shape: {D_out_source.shape}, D_source_label shape: {D_source_label.shape}")
+                        if batch_idx % 10 == 0:
+                            LOGGER.info(
+                                f"D_out_source shape: {D_out_source.shape}, D_source_label shape: {D_source_label.shape}")
 
                         # 确保使用reduction='mean'生成标量损失
                         D_source_loss = F.mse_loss(D_out_source, D_source_label, reduction='mean')
@@ -393,8 +425,9 @@ class DomainAdaptTrainer(DetectionTrainer):
                             self.device)
 
                         # 打印判别器输出和标签形状
-                        LOGGER.info(
-                            f"D_out_target shape: {D_out_target.shape}, D_target_label shape: {D_target_label.shape}")
+                        if batch_idx % 10 == 0:
+                            LOGGER.info(
+                                f"D_out_target shape: {D_out_target.shape}, D_target_label shape: {D_target_label.shape}")
 
                         # 确保使用reduction='mean'生成标量损失
                         D_target_loss = F.mse_loss(D_out_target, D_target_label, reduction='mean')
@@ -408,11 +441,17 @@ class DomainAdaptTrainer(DetectionTrainer):
                             D_loss = torch.mean(D_loss)
 
                         # 打印最终损失形状和值
-                        LOGGER.info(f"D_loss shape: {D_loss.shape}, value: {D_loss.item()}")
+                        if batch_idx % 10 == 0:
+                            LOGGER.info(f"D_loss shape: {D_loss.shape}, value: {D_loss.item()}")
 
-                        # 反向传播
-                        D_loss.backward()
-                        self.optimizer_D.step()
+                        # 反向传播 - 使用try/except包装
+                        try:
+                            assert D_loss.numel() == 1, f"D_loss must be scalar for backward(), got shape {D_loss.shape}"
+                            D_loss.backward()
+                            self.optimizer_D.step()
+                        except Exception as e:
+                            LOGGER.error(f"Error in discriminator backward pass: {e}")
+                            # 继续下一个批次的训练
 
                         # 明确释放不再需要的张量
                         del source_features_detached, target_features_detached
@@ -423,7 +462,8 @@ class DomainAdaptTrainer(DetectionTrainer):
                         source_D_out = self.discriminator(source_features)
 
                         # 打印生成器相关张量形状
-                        LOGGER.info(f"source_D_out shape: {source_D_out.shape}")
+                        if batch_idx % 10 == 0:
+                            LOGGER.info(f"source_D_out shape: {source_D_out.shape}")
 
                         # 确保使用reduction='mean'生成标量损失
                         G_source_loss = F.mse_loss(source_D_out, D_target_label, reduction='mean')
@@ -434,10 +474,16 @@ class DomainAdaptTrainer(DetectionTrainer):
                             G_source_loss = torch.mean(G_source_loss)
 
                         # 打印最终损失形状和值
-                        LOGGER.info(f"G_source_loss shape: {G_source_loss.shape}, value: {G_source_loss.item()}")
+                        if batch_idx % 10 == 0:
+                            LOGGER.info(f"G_source_loss shape: {G_source_loss.shape}, value: {G_source_loss.item()}")
 
-                        # 反向传播
-                        G_source_loss.backward()
+                        # 反向传播 - 使用try/except包装
+                        try:
+                            assert G_source_loss.numel() == 1, f"G_source_loss must be scalar for backward(), got shape {G_source_loss.shape}"
+                            G_source_loss.backward()
+                        except Exception as e:
+                            LOGGER.error(f"Error in generator backward pass: {e}")
+                            # 继续下一步
 
                         # 记录损失
                         if self.args.amp:
