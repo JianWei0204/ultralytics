@@ -5,12 +5,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import yaml
+import gc  # 垃圾回收模块
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from ultralytics.utils import LOGGER, RANK, colorstr
 from ultralytics.utils.torch_utils import de_parallel
 from ultralytics.models.yolo.detect import DetectionTrainer
+from ultralytics.nn.tasks import DetectionLoss
 
 from trans_discriminator import TransformerDiscriminator
 from feature_extractor import FeatureExtractor
@@ -66,9 +68,22 @@ class DomainAdaptTrainer(DetectionTrainer):
         # 初始化标准训练设置
         super()._setup_train(world_size)
 
+        # 确保compute_loss存在（可能在父类中已初始化，但为确保安全，我们再次检查）
+        if not hasattr(self, 'compute_loss'):
+            self.compute_loss = DetectionLoss(self.model)  # 重新初始化损失函数
+            LOGGER.info("Initialized compute_loss in domain adaptation trainer")
+
         # 设置设备
         self.device = next(self.model.parameters()).device
         LOGGER.info(f"Model is on device: {self.device}")
+
+        # 将模型移动到GPU（如果可用）
+        if torch.cuda.is_available() and self.device.type != 'cuda':
+            LOGGER.info(f"Moving model to CUDA device")
+            self.model.to('cuda')
+            self.device = next(self.model.parameters()).device
+            # 重新初始化损失函数，确保它也在正确的设备上
+            self.compute_loss = DetectionLoss(self.model)
 
         # 如果启用了域适应，则设置相关组件
         if self.domain_adapt_enabled:
@@ -108,8 +123,9 @@ class DomainAdaptTrainer(DetectionTrainer):
                     batch=self.args.batch
                 )
 
-                # 直接创建DataLoader
-                batch_size = self.batch_size // max(world_size, 1)
+                # 目标域的批次大小
+                target_batch_size = self.batch_size // max(world_size, 1)
+
                 nw = min([os.cpu_count() // max(world_size, 1), self.args.workers, 8])
                 collate_fn = self.target_dataset.collate_fn
 
@@ -117,7 +133,7 @@ class DomainAdaptTrainer(DetectionTrainer):
                     # 非分布式训练
                     self.target_loader = DataLoader(
                         dataset=self.target_dataset,
-                        batch_size=batch_size,
+                        batch_size=target_batch_size,
                         shuffle=True,
                         num_workers=nw,
                         collate_fn=collate_fn,
@@ -131,7 +147,7 @@ class DomainAdaptTrainer(DetectionTrainer):
                     )
                     self.target_loader = DataLoader(
                         dataset=self.target_dataset,
-                        batch_size=batch_size,
+                        batch_size=target_batch_size,
                         sampler=sampler,
                         num_workers=nw,
                         collate_fn=collate_fn,
@@ -142,7 +158,8 @@ class DomainAdaptTrainer(DetectionTrainer):
                 # 初始化判别器及其优化器
                 self.setup_discriminator()
 
-                LOGGER.info(f"Target domain dataloader created with {len(self.target_loader)} batches")
+                LOGGER.info(
+                    f"Target domain dataloader created with {len(self.target_loader)} batches, batch size: {target_batch_size}")
 
             except Exception as e:
                 LOGGER.error(f"Error loading target domain dataset: {e}")
@@ -264,13 +281,19 @@ class DomainAdaptTrainer(DetectionTrainer):
 
                 # 前向传播和计算源域损失
                 preds = self.model(batch['img'])
+
+                # 确保compute_loss已正确初始化
+                if not hasattr(self, 'compute_loss'):
+                    LOGGER.error("compute_loss attribute is missing, reinitializing")
+                    self.compute_loss = DetectionLoss(self.model)
+
                 self.loss, self.loss_items = self.compute_loss(preds, batch)
 
                 # 标准反向传播与参数更新
                 self.scaler.scale(self.loss).backward()
 
                 # 域对抗训练部分 --------------------
-                if (batch_idx + 1) % self.args.accumulate == 0:
+                if (batch_idx + 1) % accumulate == 0:
                     try:
                         # 获取源域特征
                         source_features = self.feature_extractor.get_features()
@@ -290,7 +313,8 @@ class DomainAdaptTrainer(DetectionTrainer):
                         target_batch = self.preprocess_batch(target_batch)
 
                         # 前向传播获取目标域特征
-                        _ = self.model(target_batch['img'])
+                        with torch.no_grad():  # 减少内存占用
+                            _ = self.model(target_batch['img'])
                         target_features = self.feature_extractor.get_features()
 
                         if target_features is None:
@@ -299,13 +323,16 @@ class DomainAdaptTrainer(DetectionTrainer):
 
                         # 判别器训练 - 源域 (给定标签0)
                         self.optimizer_D.zero_grad()
-                        D_out_source = self.discriminator(source_features.detach())
+                        # 分离特征以减少内存使用
+                        source_features_detached = source_features.detach()
+                        D_out_source = self.discriminator(source_features_detached)
                         D_source_label = torch.FloatTensor(D_out_source.data.size()).fill_(self.source_label).to(
                             self.device)
                         D_source_loss = F.mse_loss(D_out_source, D_source_label)
 
                         # 判别器训练 - 目标域 (给定标签1)
-                        D_out_target = self.discriminator(target_features.detach())
+                        target_features_detached = target_features.detach()
+                        D_out_target = self.discriminator(target_features_detached)
                         D_target_label = torch.FloatTensor(D_out_target.data.size()).fill_(self.target_label).to(
                             self.device)
                         D_target_loss = F.mse_loss(D_out_target, D_target_label)
@@ -314,6 +341,10 @@ class DomainAdaptTrainer(DetectionTrainer):
                         D_loss = (D_source_loss + D_target_loss) / 2
                         D_loss.backward()
                         self.optimizer_D.step()
+
+                        # 明确释放不再需要的张量
+                        del source_features_detached, target_features_detached
+                        del D_out_source, D_out_target
 
                         # 源域特征对抗训练 (混淆判别器)
                         self.optimizer.zero_grad()
@@ -341,6 +372,12 @@ class DomainAdaptTrainer(DetectionTrainer):
                         import traceback
                         LOGGER.error(traceback.format_exc())
 
+                    # 明确释放不再需要的特征
+                    if 'source_features' in locals():
+                        del source_features
+                    if 'target_features' in locals():
+                        del target_features
+
                 # 执行余下的标准训练步骤
                 if self.args.amp:
                     self.scaler.step(self.optimizer)
@@ -355,6 +392,13 @@ class DomainAdaptTrainer(DetectionTrainer):
 
                 # 更新进度条
                 self.update_pbar(pbar, batch_idx, epoch)
+
+                # 主动触发垃圾回收（在GPU上可以不那么频繁）
+                if batch_idx % 50 == 0:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    else:
+                        gc.collect()
 
             # 处理每个epoch结束时的操作
             self.run_callbacks('on_train_epoch_end')
