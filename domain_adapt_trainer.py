@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import time
 import os
+import yaml
 
 from ultralytics.utils import LOGGER, RANK
 from ultralytics.utils.torch_utils import de_parallel
@@ -73,8 +74,32 @@ class DomainAdaptTrainer(DetectionTrainer):
 
             # 加载目标域数据集并创建数据加载器
             LOGGER.info(f"Loading target domain dataset: {self.target_data}")
+
+            # 解析目标域YAML文件以获取实际图像路径
+            try:
+                with open(self.target_data, 'r') as f:
+                    target_yaml = yaml.safe_load(f)
+
+                # 获取基础路径和训练图像路径
+                base_path = target_yaml.get('path', '')
+                train_path = target_yaml.get('train', '')
+
+                if not base_path or not train_path:
+                    raise ValueError(f"Missing 'path' or 'train' in {self.target_data}")
+
+                # 构建完整的训练图像路径
+                target_img_path = os.path.join(base_path, train_path)
+                LOGGER.info(f"Target domain train path: {target_img_path}")
+
+                # 检查路径是否存在
+                if not os.path.exists(target_img_path):
+                    raise FileNotFoundError(f"Target domain path does not exist: {target_img_path}")
+            except Exception as e:
+                LOGGER.error(f"Error loading target domain dataset: {e}")
+                raise
+
             self.target_dataset = self.build_dataset(
-                img_path=self.target_data,
+                img_path=target_img_path, # 使用完整路径
                 mode="train",
                 batch=self.args.batch
             )
