@@ -56,6 +56,9 @@ class DomainAdaptTrainer(DetectionTrainer):
         # 进度条描述格式
         self.epoch_desc = "Epoch {epoch}"
 
+        # 显式添加epoch属性
+        self.epoch = 0
+
     def setup_domain_adaptation(self, target_data, disc_lr=0.001):
         """设置域适应训练需要的参数和组件"""
         self.target_data = target_data
@@ -270,6 +273,9 @@ class DomainAdaptTrainer(DetectionTrainer):
             self.model.train()
             if self.discriminator:
                 self.discriminator.train()
+
+            # 显式设置当前epoch属性
+            self.epoch = epoch
 
             # 更新学习率
             self.update_optimizer(epoch)
@@ -537,13 +543,24 @@ class DomainAdaptTrainer(DetectionTrainer):
 
             # 执行验证 - 添加错误处理
             try:
+                # 显式设置当前epoch属性以确保验证可以访问
+                self.epoch = epoch
+
                 val_interval = getattr(self.args, 'val_interval', 1)  # 如果不存在，默认为1
                 if (epoch + 1) % val_interval == 0:
                     self.validate()
-            except AttributeError:
-                # 如果val_interval不存在，每个epoch都进行验证
+            except AttributeError as e:
+                # 如果val_interval不存在或其他属性错误
+                LOGGER.warning(f"AttributeError during validation: {e}")
                 LOGGER.warning("'val_interval' not found in configuration, using default value of 1")
-                self.validate()
+                # 确保epoch属性已设置
+                self.epoch = epoch
+                try:
+                    self.validate()
+                except Exception as val_e:
+                    LOGGER.error(f"Validation failed: {val_e}")
+                    import traceback
+                    LOGGER.error(traceback.format_exc())
             except Exception as e:
                 LOGGER.error(f"Error during validation: {e}")
                 import traceback
