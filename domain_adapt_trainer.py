@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import os
 import yaml
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from ultralytics.utils import LOGGER, RANK, colorstr
 from ultralytics.utils.torch_utils import de_parallel
@@ -47,6 +48,9 @@ class DomainAdaptTrainer(DetectionTrainer):
 
         # 保存设备信息
         self.device = None
+
+        # 进度条描述格式
+        self.epoch_desc = "Epoch {epoch}"
 
     def setup_domain_adaptation(self, target_data, disc_lr=0.001):
         """设置域适应训练需要的参数和组件"""
@@ -188,12 +192,11 @@ class DomainAdaptTrainer(DetectionTrainer):
 
         # 更新主模型的学习率
         for param_group in self.optimizer.param_groups:
-            param_group['lr'] = param_group['initial_lr'] * lr_factor
-
-        # 如果有warmup，在前几个epoch中使用更高的学习率
-        if epoch < self.args.warmup_epochs:
-            # 暂时不处理warmup逻辑，如有需要可以添加
-            pass
+            if 'initial_lr' in param_group:
+                param_group['lr'] = param_group['initial_lr'] * lr_factor
+            else:
+                # 如果没有initial_lr，直接设置lr
+                param_group['lr'] = self.args.lr0 * lr_factor
 
         # 记录主模型的学习率
         if epoch % 10 == 0 or epoch == 0:  # 每10个epoch记录一次
@@ -227,8 +230,14 @@ class DomainAdaptTrainer(DetectionTrainer):
             # 更新学习率
             self.update_optimizer(epoch)
 
-            # 设置进度条
-            pbar = self.progress_bar(self.train_loader, description=self.epoch_desc.format(epoch=epoch))
+            # 设置进度条 - 使用tqdm直接创建
+            if RANK in (-1, 0):
+                pbar = tqdm(enumerate(self.train_loader),
+                            total=len(self.train_loader),
+                            desc=f"Epoch {epoch + 1}/{self.epochs}")
+            else:
+                pbar = enumerate(self.train_loader)
+
             self.batch_i = 0
 
             # 创建目标域数据迭代器以便循环使用
@@ -238,7 +247,7 @@ class DomainAdaptTrainer(DetectionTrainer):
             accumulate = max(round(self.args.nbs / self.batch_size), 1)
 
             # 批次迭代
-            for batch_idx, batch in enumerate(pbar):
+            for batch_idx, batch in pbar:
                 self.batch_i = batch_idx
 
                 # 调用回调函数
@@ -374,10 +383,11 @@ class DomainAdaptTrainer(DetectionTrainer):
         # 获取内存信息
         mem = f'{torch.cuda.memory_reserved() / 1E9:.3g}G' if torch.cuda.is_available() else 'CPU'
 
-        # 显示进度和损失
-        pbar.set_description(
-            f"{epoch + 1}/{self.epochs} {mem} {self.loss_items[0]:.4f} {self.loss_items[1]:.4f} {self.loss_items[2]:.4f}"
-        )
+        # 如果是tqdm进度条对象，更新描述
+        if RANK in (-1, 0) and hasattr(pbar, 'set_description'):
+            pbar.set_description(
+                f"{epoch + 1}/{self.epochs} {mem} {self.loss_items[0]:.4f} {self.loss_items[1]:.4f} {self.loss_items[2]:.4f}"
+            )
 
     def preprocess_batch(self, batch):
         """预处理批次数据，确保数据在正确的设备上"""
