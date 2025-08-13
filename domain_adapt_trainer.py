@@ -336,7 +336,7 @@ class DomainAdaptTrainer(DetectionTrainer):
                     # 继续下一个批次
                     continue
 
-                # 域对抗训练部分 --------------------
+                    # 域对抗训练部分 --------------------
                 if (batch_idx + 1) % accumulate == 0:
                     try:
                         # 获取源域特征
@@ -344,6 +344,9 @@ class DomainAdaptTrainer(DetectionTrainer):
                         if source_features is None:
                             LOGGER.warning("Failed to extract source domain features.")
                             continue
+
+                        # 打印源域特征形状以便调试
+                        LOGGER.info(f"Source domain features shape: {source_features.shape}")
 
                         # 获取目标域数据
                         try:
@@ -365,6 +368,9 @@ class DomainAdaptTrainer(DetectionTrainer):
                             LOGGER.warning("Failed to extract target domain features.")
                             continue
 
+                        # 打印目标域特征形状以便调试
+                        LOGGER.info(f"Target domain features shape: {target_features.shape}")
+
                         # 判别器训练 - 源域 (给定标签0)
                         self.optimizer_D.zero_grad()
                         # 分离特征以减少内存使用
@@ -372,17 +378,39 @@ class DomainAdaptTrainer(DetectionTrainer):
                         D_out_source = self.discriminator(source_features_detached)
                         D_source_label = torch.FloatTensor(D_out_source.data.size()).fill_(self.source_label).to(
                             self.device)
-                        D_source_loss = F.mse_loss(D_out_source, D_source_label)
+
+                        # 打印判别器输出和标签形状
+                        LOGGER.info(
+                            f"D_out_source shape: {D_out_source.shape}, D_source_label shape: {D_source_label.shape}")
+
+                        # 确保使用reduction='mean'生成标量损失
+                        D_source_loss = F.mse_loss(D_out_source, D_source_label, reduction='mean')
 
                         # 判别器训练 - 目标域 (给定标签1)
                         target_features_detached = target_features.detach()
                         D_out_target = self.discriminator(target_features_detached)
                         D_target_label = torch.FloatTensor(D_out_target.data.size()).fill_(self.target_label).to(
                             self.device)
-                        D_target_loss = F.mse_loss(D_out_target, D_target_label)
+
+                        # 打印判别器输出和标签形状
+                        LOGGER.info(
+                            f"D_out_target shape: {D_out_target.shape}, D_target_label shape: {D_target_label.shape}")
+
+                        # 确保使用reduction='mean'生成标量损失
+                        D_target_loss = F.mse_loss(D_out_target, D_target_label, reduction='mean')
 
                         # 总判别器损失并更新
                         D_loss = (D_source_loss + D_target_loss) / 2
+
+                        # 确保D_loss是标量
+                        if D_loss.numel() > 1:
+                            LOGGER.warning(f"D_loss is not scalar! Shape: {D_loss.shape}")
+                            D_loss = torch.mean(D_loss)
+
+                        # 打印最终损失形状和值
+                        LOGGER.info(f"D_loss shape: {D_loss.shape}, value: {D_loss.item()}")
+
+                        # 反向传播
                         D_loss.backward()
                         self.optimizer_D.step()
 
@@ -393,8 +421,22 @@ class DomainAdaptTrainer(DetectionTrainer):
                         # 源域特征对抗训练 (混淆判别器)
                         self.optimizer.zero_grad()
                         source_D_out = self.discriminator(source_features)
-                        # 这里我们希望源域特征被判别为目标域
-                        G_source_loss = F.mse_loss(source_D_out, D_target_label)
+
+                        # 打印生成器相关张量形状
+                        LOGGER.info(f"source_D_out shape: {source_D_out.shape}")
+
+                        # 确保使用reduction='mean'生成标量损失
+                        G_source_loss = F.mse_loss(source_D_out, D_target_label, reduction='mean')
+
+                        # 确保G_source_loss是标量
+                        if G_source_loss.numel() > 1:
+                            LOGGER.warning(f"G_source_loss is not scalar! Shape: {G_source_loss.shape}")
+                            G_source_loss = torch.mean(G_source_loss)
+
+                        # 打印最终损失形状和值
+                        LOGGER.info(f"G_source_loss shape: {G_source_loss.shape}, value: {G_source_loss.item()}")
+
+                        # 反向传播
                         G_source_loss.backward()
 
                         # 记录损失
