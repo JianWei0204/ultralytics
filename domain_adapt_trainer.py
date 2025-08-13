@@ -175,17 +175,38 @@ class DomainAdaptTrainer(DetectionTrainer):
 
     def update_optimizer(self, epoch):
         """更新优化器的学习率"""
-        # 调用父类的方法更新检测模型的优化器
-        super().update_optimizer(epoch)
+        # 计算主模型的学习率 - 使用余弦退火策略
+        if self.args.cos_lr:
+            # 余弦退火学习率
+            self.lf = lambda x: (1 - x / self.epochs) * (1.0 - self.args.lrf) + self.args.lrf  # cosine
+        else:
+            # 线性学习率
+            self.lf = lambda x: (1 - x / self.epochs) * (1.0 - self.args.lrf) + self.args.lrf  # linear
+
+        # 计算当前epoch的学习率因子
+        lr_factor = self.lf(epoch)
+
+        # 更新主模型的学习率
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = param_group['initial_lr'] * lr_factor
+
+        # 如果有warmup，在前几个epoch中使用更高的学习率
+        if epoch < self.args.warmup_epochs:
+            # 暂时不处理warmup逻辑，如有需要可以添加
+            pass
+
+        # 记录主模型的学习率
+        if epoch % 10 == 0 or epoch == 0:  # 每10个epoch记录一次
+            LOGGER.info(f'Optimizer learning rate adjusted to {self.optimizer.param_groups[0]["lr"]:.6f}')
 
         # 更新判别器的学习率（如果启用了域适应）
         if self.domain_adapt_enabled and self.optimizer_D is not None:
-            # 使用余弦退火调整学习率
-            current_lr = self.lrf * (1 - epoch / self.epochs) * self.disc_lr
+            # 使用同样的余弦退火调整判别器学习率
+            current_lr = self.disc_lr * lr_factor
             for param_group in self.optimizer_D.param_groups:
                 param_group['lr'] = current_lr
 
-            if epoch % 10 == 0:  # 每10个epoch记录一次
+            if epoch % 10 == 0 or epoch == 0:  # 每10个epoch记录一次
                 LOGGER.info(f'Discriminator learning rate adjusted to {current_lr:.6f}')
 
     def _do_train(self, world_size=1):
