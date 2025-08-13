@@ -3,11 +3,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import time
 import os
 import yaml
 from torch.utils.data import DataLoader
-import itertools
 
 from ultralytics.utils import LOGGER, RANK, colorstr
 from ultralytics.utils.torch_utils import de_parallel
@@ -174,6 +172,21 @@ class DomainAdaptTrainer(DetectionTrainer):
         self.optimizer_D.zero_grad()
 
         LOGGER.info(f"Discriminator initialized with learning rate {self.disc_lr}")
+
+    def update_optimizer(self, epoch):
+        """更新优化器的学习率"""
+        # 调用父类的方法更新检测模型的优化器
+        super().update_optimizer(epoch)
+
+        # 更新判别器的学习率（如果启用了域适应）
+        if self.domain_adapt_enabled and self.optimizer_D is not None:
+            # 使用余弦退火调整学习率
+            current_lr = self.lrf * (1 - epoch / self.epochs) * self.disc_lr
+            for param_group in self.optimizer_D.param_groups:
+                param_group['lr'] = current_lr
+
+            if epoch % 10 == 0:  # 每10个epoch记录一次
+                LOGGER.info(f'Discriminator learning rate adjusted to {current_lr:.6f}')
 
     def _do_train(self, world_size=1):
         """执行训练，包括域适应部分"""
