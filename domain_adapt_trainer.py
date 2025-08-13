@@ -253,6 +253,12 @@ class DomainAdaptTrainer(DetectionTrainer):
                 # 调用回调函数
                 self.run_callbacks('on_train_batch_start')
 
+                # 打印第一个批次的图像信息以进行调试
+                if batch_idx == 0 and epoch == 0:
+                    if 'img' in batch:
+                        LOGGER.info(f"Image batch shape: {batch['img'].shape}, dtype: {batch['img'].dtype}, "
+                                    f"min: {batch['img'].min().item()}, max: {batch['img'].max().item()}")
+
                 # 载入批次到指定设备
                 batch = self.preprocess_batch(batch)
 
@@ -390,14 +396,27 @@ class DomainAdaptTrainer(DetectionTrainer):
             )
 
     def preprocess_batch(self, batch):
-        """预处理批次数据，确保数据在正确的设备上"""
+        """预处理批次数据，确保数据在正确的设备上和正确的数据类型"""
         # 如果批次为空（可能是目标域没有标签），则创建空字典
         if batch is None:
             return {'img': None}
 
-        # 将图像移动到指定设备
+        # 将图像移动到指定设备，并确保数据类型正确
         if 'img' in batch:
-            batch['img'] = batch['img'].to(self.device, non_blocking=True)
+            # 检查图像数据类型并进行必要的转换
+            img = batch['img']
+
+            # 如果图像是浮点型，确保已经归一化
+            if img.dtype == torch.float32:
+                # 确保数值范围在[0,1]
+                if img.max() > 1.0:
+                    img = img / 255.0
+            # 如果图像是整型，转换为浮点型并归一化
+            elif img.dtype == torch.uint8:
+                img = img.float() / 255.0
+
+            # 将处理后的图像移动到指定设备
+            batch['img'] = img.to(self.device, non_blocking=True)
 
         # 将标签移动到指定设备（如果存在）
         if 'cls' in batch:
