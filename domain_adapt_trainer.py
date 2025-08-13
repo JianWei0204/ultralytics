@@ -506,11 +506,30 @@ class DomainAdaptTrainer(DetectionTrainer):
             # 将处理后的图像移动到指定设备
             batch['img'] = img.to(self.device, non_blocking=True)
 
-        # 将标签移动到指定设备（如果存在）
-        if 'cls' in batch:
-            batch['cls'] = batch['cls'].to(self.device)
-        if 'bboxes' in batch:
-            batch['bboxes'] = batch['bboxes'].to(self.device)
+        # 确保批次中的所有元素都在相同设备上
+        for k in batch:
+            if k != 'img' and torch.is_tensor(batch[k]):
+                batch[k] = batch[k].to(self.device, non_blocking=True)
+
+        # 特别处理batch_idx，确保它存在且在正确设备上
+        if 'batch_idx' not in batch and 'cls' in batch and 'bboxes' in batch:
+            # 计算每个标签对应的批次索引
+            cls_tensor = batch['cls']
+            if len(cls_tensor.shape) == 1:
+                num_labels = cls_tensor.shape[0]
+            else:
+                num_labels = cls_tensor.shape[0] * cls_tensor.shape[1]
+
+            # 创建批次索引张量
+            if num_labels > 0:
+                # 如果标签不为空，为每个标签分配批次索引
+                # 假设每个图像有相同数量的标签
+                batch_size = batch['img'].shape[0]
+                labels_per_image = num_labels // batch_size
+                batch['batch_idx'] = torch.arange(batch_size, device=self.device).repeat_interleave(labels_per_image)
+            else:
+                # 如果没有标签，创建空张量
+                batch['batch_idx'] = torch.tensor([], device=self.device)
 
         return batch
 

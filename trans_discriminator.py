@@ -5,6 +5,7 @@ import numpy as np
 import warnings
 from GRL import GradientScalarLayer
 
+
 def drop_path(x, drop_prob: float = 0., training: bool = False):
     """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
     This is the same as the DropConnect impl I created for EfficientNet, etc networks, however,
@@ -26,12 +27,14 @@ def drop_path(x, drop_prob: float = 0., training: bool = False):
 class DropPath(nn.Module):
     """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
     """
+
     def __init__(self, drop_prob=None):
         super(DropPath, self).__init__()
         self.drop_prob = drop_prob
 
     def forward(self, x):
         return drop_path(x, self.drop_prob, self.training)
+
 
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):
     # Cut & paste from PyTorch official master until it's in a few official releases - RW
@@ -89,18 +92,21 @@ def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
     """
     return _no_grad_trunc_normal_(tensor, mean, std, a, b)
 
+
 class matmul(nn.Module):
     def __init__(self):
         super().__init__()
-        
+
     def forward(self, x1, x2):
-        x = x1@x2
+        x = x1 @ x2
         return x
+
 
 def count_matmul(m, x, y):
     num_mul = x[0].numel() * x[1].size(-1)
     # m.total_ops += torch.DoubleTensor([int(num_mul)])
     m.total_ops += torch.DoubleTensor([int(0)])
+
 
 class PixelNorm(nn.Module):
     def __init__(self, dim):
@@ -108,6 +114,7 @@ class PixelNorm(nn.Module):
 
     def forward(self, input):
         return input * torch.rsqrt(torch.mean(input ** 2, dim=2, keepdim=True) + 1e-8)
+
 
 def gelu(x):
     """ Original Implementation of the gelu activation function in Google Bert repo when initialy created.
@@ -117,8 +124,10 @@ def gelu(x):
     """
     return x * 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
 
+
 def leakyrelu(x):
     return nn.functional.leaky_relu_(x, 0.2)
+
 
 class CustomAct(nn.Module):
     def __init__(self, act_layer):
@@ -127,10 +136,11 @@ class CustomAct(nn.Module):
             self.act_layer = gelu
         elif act_layer == "leakyrelu":
             self.act_layer = leakyrelu
-        
+
     def forward(self, x):
         return self.act_layer(x)
-        
+
+
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=gelu, drop=0.):
         super().__init__()
@@ -169,7 +179,7 @@ class Attention(nn.Module):
         B, N, C = x.shape
         x = x + torch.randn([x.size(0), x.size(1), 1], device=x.device) * self.noise_strength_1
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
 
         attn = (self.mat(q, k.transpose(-2, -1))) * self.scale
         attn = attn.softmax(dim=-1)
@@ -179,6 +189,7 @@ class Attention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+
 
 class CustomNorm(nn.Module):
     def __init__(self, norm_layer, dim):
@@ -192,19 +203,21 @@ class CustomNorm(nn.Module):
             self.norm = nn.InstanceNorm1d(dim)
         elif norm_layer == "pn":
             self.norm = PixelNorm(dim)
-        
+
     def forward(self, x):
         if self.norm_type == "bn" or self.norm_type == "in":
-            x = self.norm(x.permute(0,2,1)).permute(0,2,1)
+            x = self.norm(x.permute(0, 2, 1)).permute(0, 2, 1)
             return x
         elif self.norm_type == "none":
             return x
         else:
             return self.norm(x)
 
+
 def _downsample(x):
     # Downsample (Mean Avg Pooling with 2x2 kernel)
     return nn.AvgPool2d(kernel_size=2)(x)
+
 
 class DisBlock(nn.Module):
 
@@ -222,58 +235,57 @@ class DisBlock(nn.Module):
         self.gain = np.sqrt(0.5) if norm_layer == "none" else 1
 
     def forward(self, x):
-        x = x*self.gain + self.drop_path(self.attn(self.norm1(x)))*self.gain
-        x = x*self.gain + self.drop_path(self.mlp(self.norm2(x)))*self.gain
+        x = x * self.gain + self.drop_path(self.attn(self.norm1(x))) * self.gain
+        x = x * self.gain + self.drop_path(self.mlp(self.norm2(x))) * self.gain
         return x
 
 
 class TransformerDiscriminator(nn.Module):
     """ Vision Transformer with support for patch or hybrid CNN input stage
     """
-    def __init__(self, patch_size=None, channels=256, num_classes=1, img_size=128, embed_dim=None, depth=2,
+
+    def __init__(self, patch_size=None, channels=256, num_classes=1, img_size=None, embed_dim=None, depth=2,
                  num_heads=4, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=nn.LayerNorm):
         super().__init__()
         self.num_classes = num_classes
         self.num_features = embed_dim = self.embed_dim = channels
-        
+
         # depth = 7
         # self.args = args
         patch_size = 4
         norm_layer = 'ln'
         act_layer = 'gelu'
         mlp_ratio = 4
-        # if hybrid_backbone is not None:
-        #     self.patch_embed = HybridEmbed(
-        #         hybrid_backbone, img_size=img_size, in_chans=in_chans, embed_dim=embed_dim)
-        # else:
-        self.patch_embed = nn.Conv2d(channels, embed_dim, kernel_size=patch_size, stride=patch_size, padding=0)
-        num_patches = (img_size // patch_size)**2
 
+        # 直接使用1x1卷积作为patch embedding
+        self.patch_embed = nn.Conv2d(channels, embed_dim, kernel_size=1, stride=1, padding=0)
+
+        # 不再预先固定位置嵌入大小，而是在前向传播中动态生成
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.pos_embed = None  # 将在forward中根据输入大小动态创建
         self.pos_drop = nn.Dropout(p=drop_rate)
-        
+
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.blocks = nn.ModuleList([
             DisBlock(
-                dim=embed_dim, 
-                num_heads=num_heads, 
-                mlp_ratio=mlp_ratio, 
-                qkv_bias=qkv_bias, 
+                dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
                 qk_scale=qk_scale,
-                drop=drop_rate, 
-                attn_drop=attn_drop_rate, 
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
                 drop_path=dpr[i],
                 act_layer=act_layer,
                 norm_layer=norm_layer
             )
             for i in range(depth)])
-        
+
         self.norm = CustomNorm(norm_layer, embed_dim)
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-        trunc_normal_(self.pos_embed, std=.02)
+        # 初始化权重
         trunc_normal_(self.cls_token, std=.02)
         self.apply(self._init_weights)
         self.grl_img = GradientScalarLayer(-0.1)
@@ -283,30 +295,58 @@ class TransformerDiscriminator(nn.Module):
             trunc_normal_(m.weight, std=.02)
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-#         elif isinstance(m, nn.Conv2d):
-#             trunc_normal_(m.weight, std=.02)
-#             if isinstance(m, nn.Conv2d) and m.bias is not None:
-#                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
+    def _create_pos_embed(self, x, embed_dim):
+        """创建适合当前特征尺寸的位置嵌入"""
+        B, N, C = x.shape
+        # 创建位置嵌入
+        pos_embed = torch.zeros(1, N, embed_dim, device=x.device)
+
+        # 使用正弦位置编码初始化
+        position_ids = torch.arange(0, N, dtype=torch.float, device=x.device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, embed_dim, 2, dtype=torch.float, device=x.device) *
+                             (-math.log(10000.0) / embed_dim))
+
+        # 应用sin和cos位置编码
+        pos_embed[0, :, 0::2] = torch.sin(position_ids * div_term)
+        pos_embed[0, :, 1::2] = torch.cos(position_ids * div_term)
+
+        return nn.Parameter(pos_embed)
 
     def forward_features(self, x):
-        # if "None" not in self.args.diff_aug:
-        #     x = DiffAugment(x, self.args.diff_aug, True)
-        B = x.shape[0]
-        x = self.patch_embed(x).flatten(2).permute(0,2,1)
+        # 打印输入特征形状用于调试
+        # print(f"Input feature shape: {x.shape}")
 
-        cls_tokens = self.cls_token.expand(B, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
+        B = x.shape[0]
+        # 使用1x1卷积处理输入特征
+        x = self.patch_embed(x).flatten(2).permute(0, 2, 1)
+        # print(f"After patch_embed: {x.shape}")
+
+        # 添加分类token
+        cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
+        # print(f"After adding cls_token: {x.shape}")
+
+        # 动态创建匹配当前特征尺寸的位置嵌入
+        if self.pos_embed is None or self.pos_embed.shape[1] != x.shape[1]:
+            self.pos_embed = self._create_pos_embed(x, self.embed_dim)
+            # print(f"Created position embedding with shape: {self.pos_embed.shape}")
+
+        # 添加位置嵌入
         x = x + self.pos_embed
         x = self.pos_drop(x)
+
+        # 应用Transformer块
         for blk in self.blocks:
             x = blk(x)
 
+        # 应用规范化
         x = self.norm(x)
-        return x[:,0]
+        # 返回分类token的特征
+        return x[:, 0]
 
     def forward(self, x):
         x = self.grl_img(x)
@@ -314,7 +354,24 @@ class TransformerDiscriminator(nn.Module):
         x = self.head(x)
         return x
 
+
+# 测试代码
 if __name__ == '__main__':
-    x = torch.randn(1, 256, 20, 20)
+    # 创建不同尺寸的输入进行测试
+    x_small = torch.randn(1, 256, 8, 8)  # 小尺寸
+    x_medium = torch.randn(1, 256, 16, 16)  # 中等尺寸
+    x_large = torch.randn(1, 256, 32, 32)  # 大尺寸
+
     model = TransformerDiscriminator(channels=256)
-    out = model(x)
+
+    print("Testing with small input:")
+    out_small = model(x_small)
+    print(f"Output shape: {out_small.shape}")
+
+    print("\nTesting with medium input:")
+    out_medium = model(x_medium)
+    print(f"Output shape: {out_medium.shape}")
+
+    print("\nTesting with large input:")
+    out_large = model(x_large)
+    print(f"Output shape: {out_large.shape}")
