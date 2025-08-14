@@ -358,13 +358,15 @@ class DomainAdaptTrainer(DetectionTrainer):
                 LOGGER.info(s)
                 LOGGER.info("=" * len(s))
 
-            # 设置进度条 - 使用tqdm直接创建
+            # # 设置进度条 - 使用tqdm直接创建
+            pbar = enumerate(self.train_loader)
             if RANK in (-1, 0):
+                # 使用相同的bar_format参数
                 pbar = tqdm(enumerate(self.train_loader),
                             total=len(self.train_loader),
                             desc=f"Epoch {epoch + 1}/{self.epochs}")
-            else:
-                pbar = enumerate(self.train_loader)
+
+
 
             self.batch_i = 0
 
@@ -708,8 +710,26 @@ class DomainAdaptTrainer(DetectionTrainer):
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
         self.run_callbacks('teardown')
 
+    def _get_instances_count(self):
+        """获取当前批次中的实例数量"""
+        instances = 0
+        if hasattr(self, 'current_batch') and self.current_batch is not None:
+            if 'bboxes' in self.current_batch:
+                bboxes = self.current_batch['bboxes']
+                if isinstance(bboxes, list):
+                    instances = sum(len(b) for b in bboxes if b is not None)
+                elif torch.is_tensor(bboxes) and bboxes.numel() > 0:
+                    instances = bboxes.shape[0]
+
+        # 备用计数获取
+        if instances == 0 and hasattr(self, '_instance_counts') and hasattr(self, 'batch_i'):
+            if self.batch_i in self._instance_counts:
+                instances = self._instance_counts[self.batch_i]
+
+        return instances
+
     def update_pbar(self, pbar, batch_idx, epoch):
-        """更新进度条显示，保留原生tqdm进度条显示功能"""
+        """使用YOLOv8原生格式更新进度条"""
         # 获取GPU内存信息（以GB为单位）
         mem = f'{torch.cuda.memory_reserved() / 1E9:.1f}G' if torch.cuda.is_available() else 'CPU'
 
@@ -720,36 +740,21 @@ class DomainAdaptTrainer(DetectionTrainer):
             cls_loss = self.loss_items[1].item() if torch.is_tensor(self.loss_items[1]) else self.loss_items[1]
             dfl_loss = self.loss_items[2].item() if torch.is_tensor(self.loss_items[2]) else self.loss_items[2]
 
-            # 获取当前批次中的实例数量
-            instances = 0
-            if hasattr(self, 'current_batch') and self.current_batch is not None:
-                if 'bboxes' in self.current_batch:
-                    bboxes = self.current_batch['bboxes']
-                    if isinstance(bboxes, list):
-                        instances = sum(len(b) for b in bboxes if b is not None)
-                    elif torch.is_tensor(bboxes) and bboxes.numel() > 0:
-                        instances = bboxes.shape[0]
-
-            # 备用实例计数获取
-            if instances == 0 and hasattr(self, '_instance_counts') and hasattr(self, 'batch_i'):
-                if self.batch_i in self._instance_counts:
-                    instances = self._instance_counts[self.batch_i]
-
-            # 获取图像大小
+            # 获取实例数量和图像大小
+            instances = self._get_instances_count()
             img_size = getattr(self.args, 'imgsz', 640)
 
-            # 只更新描述部分，不包含进度条部分
-            # 使用与YOLOv8相同的格式字符串
-            s = ("%11s" * 2 + "%11.3g" * 3 + "%11d" + "%11s") % (
+            # 使用相同的格式字符串，但不包含尾部的冒号
+            description = ("%11s" * 2 + "%11.3g" * 3 + "%11d" + "%11s") % (
                 f"{epoch + 1}/{self.epochs}",
                 mem,
                 box_loss,
                 cls_loss,
                 dfl_loss,
                 instances,
-                f"{img_size}:"
+                f"{img_size}"
             )
-            pbar.set_description(s)
+            pbar.set_description(description)
 
 
     def preprocess_batch(self, batch):
