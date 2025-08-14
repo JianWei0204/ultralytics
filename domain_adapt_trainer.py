@@ -6,6 +6,9 @@ import torch.nn.functional as F
 import os
 import yaml
 import gc
+import pandas as pd
+from datetime import datetime
+from pathlib import Path
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -72,6 +75,12 @@ class DomainAdaptTrainer(DetectionTrainer):
         """设置训练与域适应组件"""
         # 初始化标准训练设置
         super()._setup_train(world_size)
+
+        # 确保结果目录存在
+        os.makedirs(self.save_dir, exist_ok=True)
+
+        # 确保results.csv文件存在 - 这里使用父类中已定义的self.csv路径
+        self.create_empty_results_csv()
 
         # 设置设备
         self.device = next(self.model.parameters()).device
@@ -162,6 +171,21 @@ class DomainAdaptTrainer(DetectionTrainer):
                 LOGGER.error(f"Error loading target domain dataset: {e}")
                 raise
 
+    def create_empty_results_csv(self):
+        """创建空的results.csv文件，如果它不存在"""
+        if not os.path.exists(self.csv):
+            LOGGER.warning(f"Results file {self.csv} not found. Creating empty results file.")
+            # 确保目录存在
+            os.makedirs(os.path.dirname(self.csv), exist_ok=True)
+            # 创建一个空的results.csv文件
+            columns = ['epoch', 'train/box_loss', 'train/cls_loss', 'train/dfl_loss',
+                       'metrics/precision(B)', 'metrics/recall(B)', 'metrics/mAP50(B)',
+                       'metrics/mAP50-95(B)', 'val/box_loss', 'val/cls_loss', 'val/dfl_loss',
+                       'lr/0', 'lr/1', 'lr/2']
+            # 创建空的DataFrame并保存
+            pd.DataFrame(columns=columns).to_csv(self.csv, index=False)
+            LOGGER.info(f"Created empty results file at {self.csv}")
+
     def setup_discriminator(self):
         """初始化域判别器及其优化器"""
         # 桥接层特征通道数
@@ -225,6 +249,44 @@ class DomainAdaptTrainer(DetectionTrainer):
 
             if epoch % 10 == 0 or epoch == 0:  # 每10个epoch记录一次
                 LOGGER.info(f'Discriminator learning rate adjusted to {current_lr:.6f}')
+
+    def validate(self):
+        """
+        验证当前模型性能，解决设备不匹配问题
+        """
+        try:
+            # 确保验证器存在
+            if not hasattr(self, 'validator') or self.validator is None:
+                LOGGER.warning("Validator not initialized, skipping validation")
+                return None
+
+            # 获取模型的设备
+            model_device = next(self.model.parameters()).device
+            LOGGER.info(f"Main model is on device: {model_device}")
+
+            # 确保验证器的模型是最新的，并且在正确的设备上
+            self.validator.model = self.model
+
+            # 验证前确保验证器模型完全在指定设备上
+            for module in self.validator.model.modules():
+                if hasattr(module, 'to') and callable(module.to):
+                    module.to(model_device)
+
+            # 检查验证器模型是否已正确移到设备上
+            validator_device = next(self.validator.model.parameters()).device
+            LOGGER.info(f"Validator model is on device: {validator_device}")
+
+            # 设置验证器设备
+            self.validator.device = model_device
+
+            # 调用父类的验证方法
+            return super().validate()
+        except Exception as e:
+            LOGGER.error(f"Error during validation: {e}")
+            import traceback
+            LOGGER.error(f"Traceback: {traceback.format_exc()}")
+            # 验证失败时返回None
+            return None
 
     def _do_train(self, world_size=1):
         """执行训练，包括域适应部分"""
@@ -541,11 +603,36 @@ class DomainAdaptTrainer(DetectionTrainer):
             # 处理每个epoch结束时的操作
             self.run_callbacks('on_train_epoch_end')
 
-            # 执行验证 - 添加错误处理
+            # 执行验证 - 强化版错误处理
             try:
                 # 显式设置当前epoch属性以确保验证可以访问
                 self.epoch = epoch
 
+                # 确保验证前CSV文件存在
+                self.create_empty_results_csv()
+
+                # 验证前确保模型完全在GPU上
+                if torch.cuda.is_available():
+                    self.model.cuda()
+
+                    # 检查模型参数设备
+                    devices = set()
+                    for module in self.model.modules():
+                        if hasattr(module, 'parameters'):
+                            for param in module.parameters(recurse=False):
+                                devices.add(param.device)
+
+                    if len(devices) > 1:
+                        LOGGER.warning(f"Model has parameters on multiple devices: {devices}")
+                        # 强制所有模块移至同一设备
+                        target_device = torch.device('cuda:0')
+                        for module in self.model.modules():
+                            if hasattr(module, 'parameters'):
+                                for param in module.parameters(recurse=False):
+                                    if param.device != target_device:
+                                        param.data = param.data.to(target_device)
+
+                # 验证间隔检查
                 val_interval = getattr(self.args, 'val_interval', 1)  # 如果不存在，默认为1
                 if (epoch + 1) % val_interval == 0:
                     self.validate()
@@ -553,8 +640,6 @@ class DomainAdaptTrainer(DetectionTrainer):
                 # 如果val_interval不存在或其他属性错误
                 LOGGER.warning(f"AttributeError during validation: {e}")
                 LOGGER.warning("'val_interval' not found in configuration, using default value of 1")
-                # 确保epoch属性已设置
-                self.epoch = epoch
                 try:
                     self.validate()
                 except Exception as val_e:
@@ -566,8 +651,28 @@ class DomainAdaptTrainer(DetectionTrainer):
                 import traceback
                 LOGGER.error(traceback.format_exc())
 
-            # 保存模型
-            self.save_model()
+            # 保存模型 - 强化错误处理
+            try:
+                # 确保CSV文件存在
+                self.create_empty_results_csv()
+
+                # 保存模型
+                self.save_model()
+            except Exception as e:
+                LOGGER.error(f"Error saving model: {e}")
+                # 备份保存方法
+                try:
+                    # 保存最小模型权重
+                    ckpt = {
+                        'epoch': self.epoch,
+                        'model': de_parallel(self.model).state_dict(),
+                        'date': datetime.now().isoformat()
+                    }
+                    save_path = str(self.save_dir / f'backup_epoch_{self.epoch}.pt')
+                    torch.save(ckpt, save_path)
+                    LOGGER.info(f"Saved backup model to {save_path}")
+                except Exception as backup_e:
+                    LOGGER.error(f"Even backup save failed: {backup_e}")
 
             # 调用回调函数
             self.run_callbacks('on_fit_epoch_end')
@@ -650,12 +755,56 @@ class DomainAdaptTrainer(DetectionTrainer):
 
     def save_model(self):
         """保存包含域适应组件的模型"""
-        # 保存标准检测模型
-        super().save_model()
+        try:
+            # 确保CSV文件存在
+            self.create_empty_results_csv()
 
-        # 如果启用了域适应，还保存判别器
-        if self.domain_adapt_enabled and self.discriminator is not None:
-            discriminator = de_parallel(self.discriminator)
-            disc_path = str(self.save_dir / f'discriminator_{self.epoch}.pt')
-            torch.save(discriminator.state_dict(), disc_path)
-            LOGGER.info(f"Saved discriminator to {disc_path}")
+            # 尝试标准保存方法
+            super().save_model()
+        except Exception as e:
+            LOGGER.error(f"Error in standard save_model: {e}")
+            import traceback
+            LOGGER.error(traceback.format_exc())
+
+            # 备份保存方法
+            try:
+                # 保存最小模型权重
+                ckpt = {
+                    'epoch': self.epoch,
+                    'model': de_parallel(self.model).state_dict(),
+                    'date': datetime.now().isoformat()
+                }
+                save_path = str(self.save_dir / f'backup_epoch_{self.epoch}.pt')
+                torch.save(ckpt, save_path)
+                LOGGER.info(f"Saved backup model to {save_path}")
+            except Exception as backup_e:
+                LOGGER.error(f"Even backup save failed: {backup_e}")
+
+        # 判别器保存逻辑 - 每 10 个 epoch 保存一次
+        try:
+            # 检查是否应该保存判别器
+            should_save = (self.epoch % 10 == 0)  # 每 10 个 epoch
+            is_final_epoch = (self.epoch == self.epochs - 1)  # 或最后一个 epoch
+
+            # 在达到保存条件时保存判别器
+            if self.domain_adapt_enabled and self.discriminator is not None and (should_save or is_final_epoch):
+                discriminator = de_parallel(self.discriminator)
+
+                # 根据情况命名保存文件
+                if is_final_epoch:
+                    # 最终模型使用特殊命名
+                    disc_path = str(self.save_dir / 'discriminator_final.pt')
+                    LOGGER.info(f"Saved final discriminator to {disc_path}")
+                else:
+                    # 中间检查点使用 epoch 编号
+                    disc_path = str(self.save_dir / f'discriminator_epoch{self.epoch}.pt')
+                    LOGGER.info(f"Saved checkpoint discriminator at epoch {self.epoch}")
+
+                # 保存模型
+                torch.save(discriminator.state_dict(), disc_path)
+            else:
+                # 记录跳过保存的日志
+                if self.domain_adapt_enabled and self.discriminator is not None:
+                    LOGGER.info(f"Skipping discriminator save for epoch {self.epoch} (not at save interval)")
+        except Exception as e:
+            LOGGER.error(f"Error saving discriminator: {e}")
