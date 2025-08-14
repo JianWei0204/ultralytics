@@ -331,6 +331,7 @@ class DomainAdaptTrainer(DetectionTrainer):
 
         # 开始训练循环
         for epoch in range(self.start_epoch, self.epochs):
+
             # 确保设置为训练模式
             self.model.train()
             if self.discriminator:
@@ -341,6 +342,21 @@ class DomainAdaptTrainer(DetectionTrainer):
 
             # 更新学习率
             self.update_optimizer(epoch)
+
+            # 在每个epoch开始时打印标题行 - 确保只有主进程打印
+            if RANK in (-1, 0):
+                # 与YOLOv8完全相同的格式
+                s = ("%11s" * (4 + len(self.loss_names))) % (
+                    "Epoch",
+                    "GPU_mem",
+                    *["box_loss", "cls_loss", "dfl_loss"],  # 损失名称
+                    "Instances",
+                    "Size",
+                )
+                # 添加标题前后的分隔线
+                LOGGER.info("=" * len(s))
+                LOGGER.info(s)
+                LOGGER.info("=" * len(s))
 
             # 设置进度条 - 使用tqdm直接创建
             if RANK in (-1, 0):
@@ -693,21 +709,71 @@ class DomainAdaptTrainer(DetectionTrainer):
         self.run_callbacks('teardown')
 
     def update_pbar(self, pbar, batch_idx, epoch):
-        """更新进度条显示"""
-        # 获取内存信息
-        mem = f'{torch.cuda.memory_reserved() / 1E9:.3g}G' if torch.cuda.is_available() else 'CPU'
+        """更新进度条显示，保留原生tqdm进度条显示功能"""
+        # 获取GPU内存信息（以GB为单位）
+        mem = f'{torch.cuda.memory_reserved() / 1E9:.1f}G' if torch.cuda.is_available() else 'CPU'
 
         # 如果是tqdm进度条对象，更新描述
         if RANK in (-1, 0) and hasattr(pbar, 'set_description'):
-            pbar.set_description(
-                f"{epoch + 1}/{self.epochs} {mem} {self.loss_items[0]:.4f} {self.loss_items[1]:.4f} {self.loss_items[2]:.4f}"
+            # 确保损失项是标量
+            box_loss = self.loss_items[0].item() if torch.is_tensor(self.loss_items[0]) else self.loss_items[0]
+            cls_loss = self.loss_items[1].item() if torch.is_tensor(self.loss_items[1]) else self.loss_items[1]
+            dfl_loss = self.loss_items[2].item() if torch.is_tensor(self.loss_items[2]) else self.loss_items[2]
+
+            # 获取当前批次中的实例数量
+            instances = 0
+            if hasattr(self, 'current_batch') and self.current_batch is not None:
+                if 'bboxes' in self.current_batch:
+                    bboxes = self.current_batch['bboxes']
+                    if isinstance(bboxes, list):
+                        instances = sum(len(b) for b in bboxes if b is not None)
+                    elif torch.is_tensor(bboxes) and bboxes.numel() > 0:
+                        instances = bboxes.shape[0]
+
+            # 备用实例计数获取
+            if instances == 0 and hasattr(self, '_instance_counts') and hasattr(self, 'batch_i'):
+                if self.batch_i in self._instance_counts:
+                    instances = self._instance_counts[self.batch_i]
+
+            # 获取图像大小
+            img_size = getattr(self.args, 'imgsz', 640)
+
+            # 只更新描述部分，不包含进度条部分
+            # 使用与YOLOv8相同的格式字符串
+            s = ("%11s" * 2 + "%11.3g" * 3 + "%11d" + "%11s") % (
+                f"{epoch + 1}/{self.epochs}",
+                mem,
+                box_loss,
+                cls_loss,
+                dfl_loss,
+                instances,
+                f"{img_size}:"
             )
+            pbar.set_description(s)
+
 
     def preprocess_batch(self, batch):
-        """预处理批次数据，确保数据在正确的设备上和正确的数据类型"""
-        # 如果批次为空（可能是目标域没有标签），则创建空字典
+        """预处理批次数据，并跟踪实例数量"""
+        # 如果批次为空，则创建空字典
         if batch is None:
             return {'img': None}
+
+        # 在处理前统计实例数
+        instance_count = 0
+        if 'bboxes' in batch:
+            bboxes = batch['bboxes']
+            if isinstance(bboxes, list):
+                instance_count = sum(len(b) for b in bboxes if b is not None)
+            elif torch.is_tensor(bboxes) and bboxes.numel() > 0:
+                instance_count = bboxes.shape[0]
+
+        # 保存当前批次的实例数量
+        if not hasattr(self, '_instance_counts'):
+            self._instance_counts = {}
+        self._instance_counts[self.batch_i] = instance_count
+
+        # 保存当前批次引用
+        self.current_batch = batch
 
         # 将图像移动到指定设备，并确保数据类型正确
         if 'img' in batch:
@@ -783,7 +849,7 @@ class DomainAdaptTrainer(DetectionTrainer):
         # 判别器保存逻辑 - 每 10 个 epoch 保存一次
         try:
             # 检查是否应该保存判别器
-            should_save = (self.epoch % 10 == 0)  # 每 10 个 epoch
+            should_save = (self.epoch % 10 == 0) and (self.epoch != 0)  # 每 10 个 epoch
             is_final_epoch = (self.epoch == self.epochs - 1)  # 或最后一个 epoch
 
             # 在达到保存条件时保存判别器
