@@ -366,10 +366,10 @@ class DomainAdaptTrainer(DetectionTrainer):
                 self.run_callbacks('on_train_batch_start')
 
                 # 打印第一个批次的图像信息以进行调试
-                if batch_idx == 0 and epoch == 0:
-                    if 'img' in batch:
-                        LOGGER.info(f"Image batch shape: {batch['img'].shape}, dtype: {batch['img'].dtype}, "
-                                    f"min: {batch['img'].min().item()}, max: {batch['img'].max().item()}")
+                # if batch_idx == 0 and epoch == 0:
+                #     if 'img' in batch:
+                #         LOGGER.info(f"Image batch shape: {batch['img'].shape}, dtype: {batch['img'].dtype}, "
+                #                     f"min: {batch['img'].min().item()}, max: {batch['img'].max().item()}")
 
                 # 载入批次到指定设备
                 batch = self.preprocess_batch(batch)
@@ -383,13 +383,13 @@ class DomainAdaptTrainer(DetectionTrainer):
                     self.loss, self.loss_items = self.compute_loss(preds, batch)
 
                     # 显示损失形状与信息 (调试)
-                    if batch_idx == 0:
-                        LOGGER.info(f"Loss shape: {self.loss.shape}, requires_grad: {self.loss.requires_grad}")
-                        LOGGER.info(f"Loss items shape: {self.loss_items.shape}")
+                    # if batch_idx == 0:
+                    #     LOGGER.info(f"Loss shape: {self.loss.shape}, requires_grad: {self.loss.requires_grad}")
+                    #     LOGGER.info(f"Loss items shape: {self.loss_items.shape}")
 
                     # 检查损失是否为标量，如果不是，取平均值
                     if self.loss.numel() > 1:
-                        LOGGER.warning(f"Loss is not scalar! Shape: {self.loss.shape}, taking mean.")
+                        # LOGGER.warning(f"Loss is not scalar! Shape: {self.loss.shape}, taking mean.")
                         self.loss = torch.mean(self.loss)
 
                     # 确保损失有梯度
@@ -802,9 +802,9 @@ class DomainAdaptTrainer(DetectionTrainer):
 
                 # 保存模型
                 torch.save(discriminator.state_dict(), disc_path)
-            else:
-                # 记录跳过保存的日志
-                if self.domain_adapt_enabled and self.discriminator is not None:
-                    LOGGER.info(f"Skipping discriminator save for epoch {self.epoch} (not at save interval)")
+            # else:
+            #     # 记录跳过保存的日志
+            #     if self.domain_adapt_enabled and self.discriminator is not None:
+            #         LOGGER.info(f"Skipping discriminator save for epoch {self.epoch} (not at save interval)")
         except Exception as e:
             LOGGER.error(f"Error saving discriminator: {e}")
