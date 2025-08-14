@@ -360,15 +360,15 @@ class DomainAdaptTrainer(DetectionTrainer):
 
             # # 设置进度条 - 使用tqdm直接创建
             if RANK in (-1, 0):
-                # 正确创建tqdm进度条 - 主进程
+                # 创建带有更大显示宽度的进度条
                 pbar = tqdm(
                     enumerate(self.train_loader),
                     total=len(self.train_loader),
-                    bar_format='{l_bar}{bar:10}{r_bar}',  # 显示进度条、百分比和速率
-                    unit='batch'
+                    bar_format='{l_bar}{bar:20}{r_bar}',  # 增加进度条宽度
+                    unit='batch',
+                    ncols=200  # 显式设置更大的列宽
                 )
             else:
-                # 非主进程只枚举不显示进度
                 pbar = enumerate(self.train_loader)
 
 
