@@ -359,12 +359,17 @@ class DomainAdaptTrainer(DetectionTrainer):
                 LOGGER.info("=" * len(s))
 
             # # 设置进度条 - 使用tqdm直接创建
-            pbar = enumerate(self.train_loader)
             if RANK in (-1, 0):
-                # 使用相同的bar_format参数
-                pbar = tqdm(enumerate(self.train_loader),
-                            total=len(self.train_loader),
-                            desc=f"Epoch {epoch + 1}/{self.epochs}")
+                # 正确创建tqdm进度条 - 主进程
+                pbar = tqdm(
+                    enumerate(self.train_loader),
+                    total=len(self.train_loader),
+                    bar_format='{l_bar}{bar:10}{r_bar}',  # 显示进度条、百分比和速率
+                    unit='batch'
+                )
+            else:
+                # 非主进程只枚举不显示进度
+                pbar = enumerate(self.train_loader)
 
 
 
