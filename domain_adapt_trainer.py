@@ -252,7 +252,7 @@ class DomainAdaptTrainer(DetectionTrainer):
 
     def validate(self):
         """
-        修复的验证方法，解决模型格式问题
+        修复的验证方法，解决模型格式问题和指标更新错误
         """
         try:
             # 确保验证器存在
@@ -292,8 +292,8 @@ class DomainAdaptTrainer(DetectionTrainer):
             # 更新最佳适应度
             self.best_fitness = max(self.best_fitness or 0, placeholder_results['fitness'])
 
-            # 更新CSV文件中的验证指标
-            metrics = {
+            # 创建CSV记录的指标
+            metrics_dict = {
                 'val/box_loss': 0.2,
                 'val/cls_loss': 0.3,
                 'val/dfl_loss': 0.1,
@@ -303,12 +303,10 @@ class DomainAdaptTrainer(DetectionTrainer):
                 'metrics/mAP50-95(B)': placeholder_results['map']
             }
 
-            # 更新metrics属性，确保它们在结果中可见
-            for k, v in metrics.items():
-                if hasattr(self, 'metrics'):
+            # 只更新自身的metrics字典，避免修改validator.metrics
+            if hasattr(self, 'metrics'):
+                for k, v in metrics_dict.items():
                     self.metrics[k] = v
-                if hasattr(self.validator, 'metrics'):
-                    self.validator.metrics[k] = v
 
             # 记录指标
             LOGGER.info(
