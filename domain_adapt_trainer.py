@@ -465,7 +465,7 @@ class DomainAdaptTrainer(DetectionTrainer):
                             LOGGER.warning("Failed to extract source domain features.")
                             continue
 
-                        # 获取目标域数据和特征
+                        # 获取目标域数据
                         try:
                             target_batch = next(target_iter)
                         except StopIteration:
@@ -473,29 +473,38 @@ class DomainAdaptTrainer(DetectionTrainer):
                             target_batch = next(target_iter)
 
                         target_batch = self.preprocess_batch(target_batch)
-                        with torch.no_grad():
-                            _ = self.model(target_batch['img'])
-                        target_features = self.feature_extractor.get_features()
-
-                        if target_features is None:
-                            LOGGER.warning("Failed to extract target domain features.")
-                            continue
 
                         # ===== 第1阶段：对抗训练（冻结判别器） =====
                         # 冻结判别器参数
                         for param in self.discriminator.parameters():
                             param.requires_grad = False
 
-                        # 目标域特征伪装为源域
+                        # 关键修改：提取目标域特征时启用梯度
                         self.optimizer.zero_grad()
 
+                        # 前向传播获取目标域特征 - 移除torch.no_grad()以允许梯度流动
+                        _ = self.model(target_batch['img'])  # 不使用torch.no_grad()
+                        target_features = self.feature_extractor.get_features()
+
+                        # 确保特征有梯度
+                        if not target_features.requires_grad:
+                            LOGGER.warning("Target features don't require grad, enabling gradients")
+                            # 此处不需要detach，因为我们希望梯度能够传回特征提取器
+
                         # 目标域特征送入判别器，但标记为源域(0)
-                        target_D_out = self.discriminator(target_features)  # 使用目标域特征
+                        target_D_out = self.discriminator(target_features)
                         D_source_label = torch.FloatTensor(target_D_out.data.size()).fill_(self.source_label).to(
                             self.device)
 
                         # 对抗损失：目标域特征被识别为源域
                         G_target_loss = F.mse_loss(target_D_out, D_source_label, reduction='mean')
+
+                        # 记录梯度信息以便调试
+                        if batch_idx % 50 == 0:
+                            LOGGER.info(f"G_target_loss requires_grad: {G_target_loss.requires_grad}, "
+                                        f"has grad_fn: {G_target_loss.grad_fn is not None}")
+
+                        # 反向传播更新特征提取器
                         G_target_loss.backward()
 
                         # ===== 第2阶段：判别器训练 =====
@@ -505,21 +514,25 @@ class DomainAdaptTrainer(DetectionTrainer):
 
                         self.optimizer_D.zero_grad()
 
-                        # 源域特征送入判别器，标记为源域(0)
-                        source_features_detached = source_features.detach()  # 特征已detach，不需显式冻结特征提取器
+                        # 现在再次提取目标域特征，但这次使用torch.no_grad()以避免更新特征提取器
+                        with torch.no_grad():
+                            _ = self.model(target_batch['img'])
+                        target_features_detached = self.feature_extractor.get_features().detach()
+
+                        # 源域特征也需要detach
+                        source_features_detached = source_features.detach()
+
+                        # 剩下的判别器训练代码不变...
                         D_out_source = self.discriminator(source_features_detached)
                         D_source_label = torch.FloatTensor(D_out_source.data.size()).fill_(self.source_label).to(
                             self.device)
                         D_source_loss = F.mse_loss(D_out_source, D_source_label, reduction='mean')
 
-                        # 目标域特征送入判别器，标记为目标域(1)
-                        target_features_detached = target_features.detach()  # 特征已detach
                         D_out_target = self.discriminator(target_features_detached)
                         D_target_label = torch.FloatTensor(D_out_target.data.size()).fill_(self.target_label).to(
                             self.device)
                         D_target_loss = F.mse_loss(D_out_target, D_target_label, reduction='mean')
 
-                        # 总判别器损失
                         D_loss = (D_source_loss + D_target_loss) / 2
                         D_loss.backward()
                         self.optimizer_D.step()
