@@ -280,12 +280,12 @@ class DomainAdaptTrainer(DetectionTrainer):
             # 应用递归设备检查
             ensure_device_recursive(base_model, device)
 
-            # 初始化评估指标 - 修复参数错误
+            # 初始化评估指标
             from ultralytics.utils.metrics import DetMetrics, box_iou
             from ultralytics.utils.ops import non_max_suppression, xywh2xyxy
 
-            # 创建指标收集器 - 只使用names参数
-            metrics = DetMetrics(names=self.data['names'])
+            # 创建指标收集器
+            metrics = DetMetrics(save_dir=self.save_dir, names=self.data['names'])
 
             # 设置验证参数
             conf_thres = 0.001  # NMS置信度阈值
@@ -371,32 +371,18 @@ class DomainAdaptTrainer(DetectionTrainer):
                 # 计算最终指标
                 metrics.process_stats(stats)
 
-                # 获取结果 - 适配DetMetrics API
-                # 由于版本差异，使用兼容方式获取结果
-                if hasattr(metrics, 'results_dict'):
-                    results_dict = metrics.results_dict
-                else:
-                    # 兼容不同版本的DetMetrics
-                    results_dict = {
-                        'metrics/precision(B)': metrics.mean_results()[0],
-                        'metrics/recall(B)': metrics.mean_results()[1],
-                        'metrics/mAP50(B)': metrics.mean_results()[2],
-                        'metrics/mAP50-95(B)': metrics.mean_results()[3]
-                    }
+                # 输出验证结果，类似于标准YOLOv8输出
+                results_dict = metrics.results_dict
+                precision = results_dict.get('metrics/precision(B)', 0.0)
+                recall = results_dict.get('metrics/recall(B)', 0.0)
+                mAP50 = results_dict.get('metrics/mAP50(B)', 0.0)
+                mAP = results_dict.get('metrics/mAP50-95(B)', 0.0)
 
-                precision = results_dict.get('metrics/precision(B)', metrics.mean_results()[0])
-                recall = results_dict.get('metrics/recall(B)', metrics.mean_results()[1])
-                mAP50 = results_dict.get('metrics/mAP50(B)', metrics.mean_results()[2])
-                mAP = results_dict.get('metrics/mAP50-95(B)', metrics.mean_results()[3])
-
-                # 获取实例总数
-                total_instances = sum(len(x[3]) for x in stats if len(x) > 0)
-
-                # 格式化输出字符串 - 与标准YOLOv8输出匹配
+                # 格式化输出字符串
                 val_result = (
                     f"\n{'Class':11s}{'Images':11s}{'Instances':11s}"
                     f"{'Box(P':11s}{'R':11s}{'mAP50':11s}{'mAP50-95':11s}\n"
-                    f"{'all':11s}{seen:11d}{total_instances:11d}"
+                    f"{'all':11s}{seen:11d}{sum([len(x) for x in stats if len(x) > 0 and len(x[3]) > 0]):11d}"
                     f"{precision:11.3f}{recall:11.3f}{mAP50:11.3f}{mAP:11.3f}"
                 )
 
