@@ -252,170 +252,102 @@ class DomainAdaptTrainer(DetectionTrainer):
 
     def validate(self):
         """
-        执行标准YOLOv8验证过程，计算实际指标并使用标准输出格式
+        执行标准YOLOv8验证过程，复用原生代码而不是重新实现
         """
         try:
             # 获取当前设备
             device = next(self.model.parameters()).device
-            LOGGER.info(f"Starting standard validation on device: {device}")
+            LOGGER.info(f"Starting validation on device: {device}")
 
             # 保存当前训练状态
-            training = self.model.training
+            model_training = self.model.training
 
             # 设置为评估模式
             self.model.eval()
 
             # 获取非并行版本的模型
             from ultralytics.utils.torch_utils import de_parallel
-            base_model = de_parallel(self.model).to(device)
+            model = de_parallel(self.model)
 
-            # 确保模型在正确的设备上
-            def ensure_device_recursive(module, target_device):
-                for name, param in module.named_parameters(recurse=False):
-                    if param.device != target_device:
-                        param.data = param.data.to(target_device)
-                for child in module.children():
-                    ensure_device_recursive(child, target_device)
+            # 1. 创建DetectionValidator实例
+            from ultralytics.models.yolo.detect import DetectionValidator
 
-            # 应用递归设备检查
-            ensure_device_recursive(base_model, device)
+            # 创建验证器实例
+            validator = DetectionValidator(
+                dataloader=self.test_loader,
+                args=self.args,
+                _callbacks=self.callbacks
+            )
 
-            # 初始化评估指标
-            from ultralytics.utils.metrics import DetMetrics, box_iou
-            from ultralytics.utils.ops import non_max_suppression, xywh2xyxy
+            # 2. 设置验证器必要的属性
+            validator.device = device
+            validator.model = model
+            validator.names = self.data['names']
+            validator.data = self.data
+            validator.save_dir = self.save_dir
+            validator.args.task = 'detect'  # 确保任务为检测
 
-            # 创建指标收集器
-            metrics = DetMetrics(save_dir=self.save_dir, names=self.data['names'])
+            # 3. 初始化验证指标
+            validator.init_metrics(model)
 
-            # 设置验证参数
-            conf_thres = 0.001  # NMS置信度阈值
-            iou_thres = 0.6  # NMS IoU阈值
+            # 4. 执行验证
+            LOGGER.info(f"Validating with {len(self.test_loader)} batches")
+            validator.seen = 0
 
-            # 遍历验证数据集
-            stats = []  # 统计数据列表
-            seen = 0  # 已处理的图像数
+            # 进度条
+            from tqdm import tqdm
+            pbar = tqdm(validator.dataloader, desc="Validation", total=len(validator.dataloader))
 
-            LOGGER.info(f"Validating on {len(self.test_loader)} batches...")
-
-            # 使用进度条更好地显示验证过程
-            pbar = tqdm(self.test_loader, desc="Validation", total=len(self.test_loader))
-
+            # 运行验证循环
             with torch.no_grad():
                 for batch_idx, batch in enumerate(pbar):
                     # 预处理批次
-                    batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                             for k, v in batch.items()}
+                    batch = validator.preprocess(batch)
 
-                    # 确保图像格式正确
-                    if 'img' in batch:
-                        batch['img'] = batch['img'].float() / 255.0
-
-                    # 获取标签和图像
-                    imgs = batch['img']
-                    seen += imgs.shape[0]
-
-                    # 前向传播
-                    preds = base_model(imgs)
+                    # 模型推理
+                    preds = validator.model(batch["img"])
 
                     # 后处理预测结果
-                    preds = non_max_suppression(
-                        preds,
-                        conf_thres=conf_thres,
-                        iou_thres=iou_thres,
-                        multi_label=True,
-                        agnostic=False,
-                        max_det=300
-                    )
+                    preds = validator.postprocess(preds)
 
-                    # 处理每张图像
-                    for si, (pred, img) in enumerate(zip(preds, imgs)):
-                        # 获取该图像的标注信息
-                        idx = batch['batch_idx'] == si
-                        cls = batch['cls'][idx].squeeze(-1)
-                        boxes = batch['bboxes'][idx]
+                    # 更新指标
+                    validator.update_metrics(preds, batch)
 
-                        # 转换为xyxy格式
-                        if len(boxes):
-                            boxes = xywh2xyxy(boxes) * img.shape[1]  # 还原到图像大小
+                    # 可视化
+                    if validator.args.plots and batch_idx < 3:
+                        validator.plot_val_samples(batch, batch_idx)
+                        validator.plot_predictions(batch, preds, batch_idx)
 
-                        # 计算指标
-                        if len(pred) == 0:
-                            if len(boxes):
-                                stats.append((torch.zeros(0, 1), torch.Tensor(), torch.Tensor(), cls.cpu()))
-                            continue
+            # 5. 完成指标计算
+            validator.finalize_metrics()
+            stats = validator.get_stats()
 
-                        # 分离预测结果
-                        predn = pred.clone()
+            # 6. 打印结果 - 删除对self.training的检查，始终使用简化输出
+            precision = stats.get('metrics/precision(B)', 0.0)
+            recall = stats.get('metrics/recall(B)', 0.0)
+            mAP50 = stats.get('metrics/mAP50(B)', 0.0)
+            mAP = stats.get('metrics/mAP50-95(B)', 0.0)
 
-                        # 计算IoU
-                        if len(boxes):
-                            iou = box_iou(boxes, predn[:, :4])
+            # 格式化输出与YOLOv8相同格式
+            LOGGER.info(f"Validation results: mAP50={mAP50:.3f}, mAP50-95={mAP:.3f}")
 
-                            # 为每个目标分配预测
-                            correct = torch.zeros(predn.shape[0], metrics.niou, dtype=torch.bool, device=device)
-                            for i, threshold in enumerate(metrics.iouv):
-                                x = torch.where((iou >= threshold) & (cls.view(1, -1) == predn[:, 5].view(-1, 1)))[0]
-                                if x.shape[0]:
-                                    matches = torch.cat((torch.stack((x, iou[x].argmax(1))).T.cpu(),
-                                                         iou[x].max(1).values.cpu()[:, None]), 1)
-                                    if x.shape[0] > 1:
-                                        matches = matches[matches[:, 2].argsort(descending=True)]
-                                        matches = matches[torch.unique(matches[:, 1], return_index=True)[1]]
-                                        matches = matches[matches[:, 2].argsort(descending=True)]
-                                        matches = matches[torch.unique(matches[:, 0], return_index=True)[1]]
-                                    correct[matches[:, 0].long(), i] = True
+            # 7. 保存结果并返回
+            self.metrics = validator.metrics
 
-                        # 收集统计数据
-                        stats.append((correct.cpu(), predn[:, 4].cpu(), predn[:, 5].cpu(), cls.cpu()))
+            # 8. 恢复训练模式
+            self.model.train(model_training)
 
-                # 计算最终指标
-                metrics.process_stats(stats)
+            # 构建结果字典
+            results = {
+                'mp': stats.get('metrics/precision(B)', 0.0),
+                'mr': stats.get('metrics/recall(B)', 0.0),
+                'map50': stats.get('metrics/mAP50(B)', 0.0),
+                'map': stats.get('metrics/mAP50-95(B)', 0.0),
+                'fitness': stats.get('fitness', 0.0)
+            }
 
-                # 输出验证结果，类似于标准YOLOv8输出
-                results_dict = metrics.results_dict
-                precision = results_dict.get('metrics/precision(B)', 0.0)
-                recall = results_dict.get('metrics/recall(B)', 0.0)
-                mAP50 = results_dict.get('metrics/mAP50(B)', 0.0)
-                mAP = results_dict.get('metrics/mAP50-95(B)', 0.0)
-
-                # 格式化输出字符串
-                val_result = (
-                    f"\n{'Class':11s}{'Images':11s}{'Instances':11s}"
-                    f"{'Box(P':11s}{'R':11s}{'mAP50':11s}{'mAP50-95':11s}\n"
-                    f"{'all':11s}{seen:11d}{sum([len(x) for x in stats if len(x) > 0 and len(x[3]) > 0]):11d}"
-                    f"{precision:11.3f}{recall:11.3f}{mAP50:11.3f}{mAP:11.3f}"
-                )
-
-                # 输出验证结果
-                LOGGER.info(val_result)
-
-                # 创建结果字典
-                results = {
-                    'mp': precision,
-                    'mr': recall,
-                    'map50': mAP50,
-                    'map': mAP,
-                    'fitness': mAP * 0.1 + mAP50 * 0.9  # 标准YOLOv8 fitness公式
-                }
-
-                # 将结果添加到self.metrics中
-                if hasattr(self, 'metrics'):
-                    self.metrics.update({
-                        'metrics/precision(B)': precision,
-                        'metrics/recall(B)': recall,
-                        'metrics/mAP50(B)': mAP50,
-                        'metrics/mAP50-95(B)': mAP,
-                        # 使用估计的损失值，因为我们没有真实的验证损失
-                        'val/box_loss': 0.2,
-                        'val/cls_loss': 0.3,
-                        'val/dfl_loss': 0.1
-                    })
-
-                # 更新最佳适应度
-                self.best_fitness = max(self.best_fitness or 0, results['fitness'])
-
-            # 恢复训练模式
-            self.model.train(training)
+            # 更新最佳适应度
+            self.best_fitness = max(self.best_fitness or 0, results['fitness'])
 
             # 清理内存
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
@@ -423,7 +355,7 @@ class DomainAdaptTrainer(DetectionTrainer):
             return results
 
         except Exception as e:
-            LOGGER.error(f"Error in standard validation: {e}")
+            LOGGER.error(f"Error in validation: {e}")
             import traceback
             LOGGER.error(traceback.format_exc())
 
@@ -440,9 +372,9 @@ class DomainAdaptTrainer(DetectionTrainer):
             # 更新最佳适应度
             self.best_fitness = max(self.best_fitness or 0, placeholder_results['fitness'])
 
-            # 确保模型恢复训练模式
+            # 确保模型恢复训练模式 - 使用保存的状态
             if hasattr(self, 'model'):
-                self.model.train(training if 'training' in locals() else True)
+                self.model.train(model_training if 'model_training' in locals() else True)
 
             return placeholder_results
 
