@@ -1,6 +1,6 @@
 path: /root/autodl-tmp/v8-bytetrack/yolov8/datasets/once
 train: images/train
-
+val: images/val
 # Classes
 names:
   0: Pedestrain
