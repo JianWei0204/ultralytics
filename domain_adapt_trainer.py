@@ -456,7 +456,7 @@ class DomainAdaptTrainer(DetectionTrainer):
                     # 继续下一个批次
                     continue
 
-                # 域对抗训练部分 --------------------
+                # 域对抗训练部分 - 简化的UDAT-car风格实现
                 if (batch_idx + 1) % accumulate == 0 and self.feature_extractor is not None:
                     try:
                         # 获取源域特征
@@ -465,23 +465,15 @@ class DomainAdaptTrainer(DetectionTrainer):
                             LOGGER.warning("Failed to extract source domain features.")
                             continue
 
-                        # 打印源域特征形状以便调试
-                        if batch_idx % 10 == 0:
-                            LOGGER.info(f"Source domain features shape: {source_features.shape}")
-
-                        # 获取目标域数据
+                        # 获取目标域数据和特征
                         try:
                             target_batch = next(target_iter)
                         except StopIteration:
-                            # 重新初始化目标域数据迭代器
                             target_iter = iter(self.target_loader)
                             target_batch = next(target_iter)
 
-                        # 预处理目标域批次
                         target_batch = self.preprocess_batch(target_batch)
-
-                        # 前向传播获取目标域特征
-                        with torch.no_grad():  # 减少内存占用
+                        with torch.no_grad():
                             _ = self.model(target_batch['img'])
                         target_features = self.feature_extractor.get_features()
 
@@ -489,113 +481,62 @@ class DomainAdaptTrainer(DetectionTrainer):
                             LOGGER.warning("Failed to extract target domain features.")
                             continue
 
-                        # 打印目标域特征形状以便调试
-                        if batch_idx % 10 == 0:
-                            LOGGER.info(f"Target domain features shape: {target_features.shape}")
+                        # ===== 第1阶段：对抗训练（冻结判别器） =====
+                        # 冻结判别器参数
+                        for param in self.discriminator.parameters():
+                            param.requires_grad = False
 
-                        # 判别器训练 - 源域 (给定标签0)
+                        # 目标域特征伪装为源域
+                        self.optimizer.zero_grad()
+
+                        # 目标域特征送入判别器，但标记为源域(0)
+                        target_D_out = self.discriminator(target_features)  # 使用目标域特征
+                        D_source_label = torch.FloatTensor(target_D_out.data.size()).fill_(self.source_label).to(
+                            self.device)
+
+                        # 对抗损失：目标域特征被识别为源域
+                        G_target_loss = F.mse_loss(target_D_out, D_source_label, reduction='mean')
+                        G_target_loss.backward()
+
+                        # ===== 第2阶段：判别器训练 =====
+                        # 解冻判别器参数
+                        for param in self.discriminator.parameters():
+                            param.requires_grad = True
+
                         self.optimizer_D.zero_grad()
-                        # 分离特征以减少内存使用
-                        source_features_detached = source_features.detach()
+
+                        # 源域特征送入判别器，标记为源域(0)
+                        source_features_detached = source_features.detach()  # 特征已detach，不需显式冻结特征提取器
                         D_out_source = self.discriminator(source_features_detached)
                         D_source_label = torch.FloatTensor(D_out_source.data.size()).fill_(self.source_label).to(
                             self.device)
-
-                        # 打印判别器输出和标签形状
-                        if batch_idx % 10 == 0:
-                            LOGGER.info(
-                                f"D_out_source shape: {D_out_source.shape}, D_source_label shape: {D_source_label.shape}")
-
-                        # 确保使用reduction='mean'生成标量损失
                         D_source_loss = F.mse_loss(D_out_source, D_source_label, reduction='mean')
 
-                        # 判别器训练 - 目标域 (给定标签1)
-                        target_features_detached = target_features.detach()
+                        # 目标域特征送入判别器，标记为目标域(1)
+                        target_features_detached = target_features.detach()  # 特征已detach
                         D_out_target = self.discriminator(target_features_detached)
                         D_target_label = torch.FloatTensor(D_out_target.data.size()).fill_(self.target_label).to(
                             self.device)
-
-                        # 打印判别器输出和标签形状
-                        if batch_idx % 10 == 0:
-                            LOGGER.info(
-                                f"D_out_target shape: {D_out_target.shape}, D_target_label shape: {D_target_label.shape}")
-
-                        # 确保使用reduction='mean'生成标量损失
                         D_target_loss = F.mse_loss(D_out_target, D_target_label, reduction='mean')
 
-                        # 总判别器损失并更新
+                        # 总判别器损失
                         D_loss = (D_source_loss + D_target_loss) / 2
+                        D_loss.backward()
+                        self.optimizer_D.step()
 
-                        # 确保D_loss是标量
-                        if D_loss.numel() > 1:
-                            LOGGER.warning(f"D_loss is not scalar! Shape: {D_loss.shape}")
-                            D_loss = torch.mean(D_loss)
-
-                        # 打印最终损失形状和值
-                        if batch_idx % 10 == 0:
-                            LOGGER.info(f"D_loss shape: {D_loss.shape}, value: {D_loss.item()}")
-
-                        # 反向传播 - 使用try/except包装
-                        try:
-                            assert D_loss.numel() == 1, f"D_loss must be scalar for backward(), got shape {D_loss.shape}"
-                            D_loss.backward()
-                            self.optimizer_D.step()
-                        except Exception as e:
-                            LOGGER.error(f"Error in discriminator backward pass: {e}")
-                            # 继续下一个批次的训练
-
-                        # 明确释放不再需要的张量
-                        del source_features_detached, target_features_detached
-                        del D_out_source, D_out_target
-
-                        # 源域特征对抗训练 (混淆判别器)
-                        self.optimizer.zero_grad()
-                        source_D_out = self.discriminator(source_features)
-
-                        # 打印生成器相关张量形状
-                        if batch_idx % 10 == 0:
-                            LOGGER.info(f"source_D_out shape: {source_D_out.shape}")
-
-                        # 确保使用reduction='mean'生成标量损失
-                        G_source_loss = F.mse_loss(source_D_out, D_target_label, reduction='mean')
-
-                        # 确保G_source_loss是标量
-                        if G_source_loss.numel() > 1:
-                            LOGGER.warning(f"G_source_loss is not scalar! Shape: {G_source_loss.shape}")
-                            G_source_loss = torch.mean(G_source_loss)
-
-                        # 打印最终损失形状和值
-                        if batch_idx % 10 == 0:
-                            LOGGER.info(f"G_source_loss shape: {G_source_loss.shape}, value: {G_source_loss.item()}")
-
-                        # 反向传播 - 使用try/except包装
-                        try:
-                            assert G_source_loss.numel() == 1, f"G_source_loss must be scalar for backward(), got shape {G_source_loss.shape}"
-                            G_source_loss.backward()
-                        except Exception as e:
-                            LOGGER.error(f"Error in generator backward pass: {e}")
-                            # 继续下一步
-
-                        # 记录损失
-                        if self.args.amp:
-                            self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                        else:
-                            self.optimizer.step()
-
-                        # 打印域适应损失信息
+                        # 记录日志
                         if batch_idx % 10 == 0:
                             LOGGER.info(
                                 f"{colorstr('green', 'bold', 'Domain Adapt')} Epoch: {epoch}, Batch: {batch_idx}, "
                                 f"D_loss: {D_loss.item():.4f}, "
-                                f"G_loss: {G_source_loss.item():.4f}")
+                                f"G_loss(Target→Source): {G_target_loss.item():.4f}")
 
                     except Exception as e:
                         LOGGER.error(f"Error in domain adaptation training: {e}")
                         import traceback
                         LOGGER.error(traceback.format_exc())
 
-                    # 明确释放不再需要的特征
+                    # 清理，释放内存
                     if 'source_features' in locals():
                         del source_features
                     if 'target_features' in locals():
