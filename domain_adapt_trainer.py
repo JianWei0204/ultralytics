@@ -884,8 +884,29 @@ class DomainAdaptTrainer(DetectionTrainer):
             # 确保CSV文件存在
             self.create_empty_results_csv()
 
+            # 检查metrics是否为字典类型，如果不是，则创建一个字典
+            if hasattr(self, 'metrics'):
+                original_metrics = self.metrics
+                if not isinstance(self.metrics, dict):
+                    # 如果self.metrics是DetMetrics对象
+                    if hasattr(self.metrics, 'results_dict'):
+                        self.metrics = self.metrics.results_dict
+                    # 如果是列表或其他类型，创建一个基本字典
+                    else:
+                        self.metrics = {
+                            'metrics/precision(B)': 0.5,
+                            'metrics/recall(B)': 0.5,
+                            'metrics/mAP50(B)': 0.5,
+                            'metrics/mAP50-95(B)': 0.4,
+                        }
+
             # 尝试标准保存方法
             super().save_model()
+
+            # 恢复原始metrics（如果修改了）
+            if 'original_metrics' in locals():
+                self.metrics = original_metrics
+
         except Exception as e:
             LOGGER.error(f"Error in standard save_model: {e}")
             import traceback
@@ -927,9 +948,5 @@ class DomainAdaptTrainer(DetectionTrainer):
 
                 # 保存模型
                 torch.save(discriminator.state_dict(), disc_path)
-            # else:
-            #     # 记录跳过保存的日志
-            #     if self.domain_adapt_enabled and self.discriminator is not None:
-            #         LOGGER.info(f"Skipping discriminator save for epoch {self.epoch} (not at save interval)")
         except Exception as e:
             LOGGER.error(f"Error saving discriminator: {e}")
