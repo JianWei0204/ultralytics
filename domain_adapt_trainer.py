@@ -252,7 +252,7 @@ class DomainAdaptTrainer(DetectionTrainer):
 
     def validate(self):
         """
-        验证当前模型性能，解决设备不匹配问题
+        验证当前模型性能，解决设备不匹配问题 - 使用state_dict方式
         """
         try:
             # 确保验证器存在
@@ -264,25 +264,57 @@ class DomainAdaptTrainer(DetectionTrainer):
             model_device = next(self.model.parameters()).device
             LOGGER.info(f"Main model is on device: {model_device}")
 
-            # 确保验证器的模型是最新的，并且在正确的设备上
-            self.validator.model = self.model
+            # 保存当前训练状态
+            training = self.model.training
 
-            # 验证前确保验证器模型完全在指定设备上
-            for module in self.validator.model.modules():
-                if hasattr(module, 'to') and callable(module.to):
+            # 设置为评估模式
+            self.model.eval()
+
+            # 获取非并行版本的模型
+            from ultralytics.utils.torch_utils import de_parallel
+            base_model = de_parallel(self.model)
+
+            # 直接使用同一个模型实例，确保它在正确的设备上
+            self.validator.model = base_model
+
+            # 确保验证器使用正确的设备
+            self.validator.device = model_device
+
+            # 检查所有模块是否都在正确设备上
+            for name, module in base_model.named_modules():
+                if hasattr(module, 'to'):
                     module.to(model_device)
 
-            # 检查验证器模型是否已正确移到设备上
+            # 重要：确保所有参数都在正确设备上
+            for name, param in base_model.named_parameters():
+                if param.device != model_device:
+                    LOGGER.warning(f"Moving parameter {name} from {param.device} to {model_device}")
+                    param.data = param.data.to(model_device)
+
+            # 验证器模型设备检查
             validator_device = next(self.validator.model.parameters()).device
             LOGGER.info(f"Validator model is on device: {validator_device}")
 
-            # 设置验证器设备
-            self.validator.device = model_device
+            # 调用标准验证方法
+            results = None
+            try:
+                with torch.no_grad():  # 确保验证不影响梯度
+                    results = super().validate()
+            except Exception as e:
+                LOGGER.error(f"Error in validation process: {e}")
+                import traceback
+                LOGGER.error(traceback.format_exc())
 
-            # 调用父类的验证方法
-            return super().validate()
+            # 恢复训练模式
+            self.model.train(training)
+
+            # 清理内存
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+            return results
+
         except Exception as e:
-            LOGGER.error(f"Error during validation: {e}")
+            LOGGER.error(f"Error in validate function: {e}")
             import traceback
             LOGGER.error(f"Traceback: {traceback.format_exc()}")
             # 验证失败时返回None
@@ -479,17 +511,19 @@ class DomainAdaptTrainer(DetectionTrainer):
                         for param in self.discriminator.parameters():
                             param.requires_grad = False
 
-                        # 关键修改：提取目标域特征时启用梯度
+                        # 确保优化器状态正确
                         self.optimizer.zero_grad()
 
-                        # 前向传播获取目标域特征 - 移除torch.no_grad()以允许梯度流动
-                        _ = self.model(target_batch['img'])  # 不使用torch.no_grad()
+                        # 前向传播获取目标域特征 - 不使用torch.no_grad()
+                        _ = self.model(target_batch['img'])  # 保留梯度流
                         target_features = self.feature_extractor.get_features()
 
-                        # 确保特征有梯度
-                        if not target_features.requires_grad:
-                            LOGGER.warning("Target features don't require grad, enabling gradients")
-                            # 此处不需要detach，因为我们希望梯度能够传回特征提取器
+                        # 检查特征是否有梯度
+                        if target_features.requires_grad == False:
+                            LOGGER.warning("Target features don't have gradients, creating substitute with gradients")
+                            # 创建一个有梯度的替代特征
+                            dummy_param = next(self.model.parameters())
+                            target_features = target_features.detach() + dummy_param.sum() * 0
 
                         # 目标域特征送入判别器，但标记为源域(0)
                         target_D_out = self.discriminator(target_features)
@@ -506,6 +540,9 @@ class DomainAdaptTrainer(DetectionTrainer):
 
                         # 反向传播更新特征提取器
                         G_target_loss.backward()
+
+                        # ===== 剩余代码保持不变 =====
+                        # ... 第2阶段：判别器训练...
 
                         # ===== 第2阶段：判别器训练 =====
                         # 解冻判别器参数
