@@ -456,6 +456,7 @@ class DomainAdaptTrainer(DetectionTrainer):
                     # 继续下一个批次
                     continue
 
+
                 # 域对抗训练部分 - 简化的UDAT-car风格实现
                 if (batch_idx + 1) % accumulate == 0 and self.feature_extractor is not None:
                     try:
