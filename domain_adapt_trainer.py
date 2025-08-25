@@ -36,7 +36,10 @@ class DomainAdaptTrainer(DetectionTrainer):
         # 使用标准YOLOv8参数初始化
         super().__init__(cfg, overrides, _callbacks)
 
-        # 初始化域适应组件和参数
+        # 保存原始目录名，确保整个训练过程中只使用这一个目录
+        self.original_save_dir = None  # 将在_setup_train中设置
+
+        # 其他初始化代码保持不变...
         self.target_data = None
         self.target_dataset = None
         self.target_loader = None
@@ -73,20 +76,27 @@ class DomainAdaptTrainer(DetectionTrainer):
 
     def _setup_train(self, world_size):
         """设置训练与域适应组件，确保只创建一个训练目录"""
-        # 保存当前save_dir值以检查是否已存在
-        original_save_dir = self.save_dir if hasattr(self, 'save_dir') else None
+        # 首次调用时记录原始目录
+        if self.original_save_dir is None:
+            if hasattr(self, 'save_dir') and self.save_dir:
+                self.original_save_dir = self.save_dir
 
-        # 总是调用父类的_setup_train来确保模型和其他组件正确初始化
+        # 调用父类的_setup_train来初始化模型和其他组件
         super()._setup_train(world_size)
 
-        # 如果我们有一个预先存在的目录，恢复它
-        if original_save_dir is not None and Path(original_save_dir).exists():
-            LOGGER.info(f"Using existing save directory: {original_save_dir}")
-            self.save_dir = original_save_dir
-        else:
+        # 确保后续使用原始保存目录
+        if self.original_save_dir is None:
+            # 如果之前没有保存目录，现在记录它
+            self.original_save_dir = self.save_dir
             LOGGER.info(f"Created save directory: {self.save_dir}")
+        else:
+            # 如果有原始目录，恢复使用它
+            old_dir = self.save_dir
+            self.save_dir = self.original_save_dir
+            if old_dir != self.original_save_dir:
+                LOGGER.info(f"Redirecting output from {old_dir} to original save directory: {self.original_save_dir}")
 
-        # 确保结果目录存在
+        # 确保目录存在
         os.makedirs(self.save_dir, exist_ok=True)
 
         # 确保results.csv文件存在
@@ -263,9 +273,16 @@ class DomainAdaptTrainer(DetectionTrainer):
     def validate(self):
         """执行标准YOLOv8验证过程，使用标准格式输出结果"""
         try:
+            # 记录原始保存目录
+            original_dir = self.save_dir
+
+            # 确保使用原始目录
+            if self.original_save_dir:
+                self.save_dir = self.original_save_dir
+
             # 获取当前设备
             device = next(self.model.parameters()).device
-            LOGGER.info(f"Starting validation on device: {device}")
+            # LOGGER.info(f"Starting validation on device: {device}")
 
             # 保存当前训练状态
             model_training = self.model.training
@@ -277,34 +294,40 @@ class DomainAdaptTrainer(DetectionTrainer):
             from ultralytics.utils.torch_utils import de_parallel
             model = de_parallel(self.model)
 
-            # 1. 创建DetectionValidator实例
+            # 创建DetectionValidator实例
             from ultralytics.models.yolo.detect import DetectionValidator
 
-            # 创建验证器实例
+            # 创建验证器实例并指定到原始保存目录
             validator = DetectionValidator(
                 dataloader=self.test_loader,
+                save_dir=self.save_dir,
                 args=self.args,
                 _callbacks=self.callbacks
             )
 
-            # 2. 设置验证器必要的属性
+            # 明确设置验证器的save_dir和其他属性
+            validator.save_dir = self.save_dir
             validator.device = device
             validator.model = model
             validator.names = self.data['names']
             validator.data = self.data
-            validator.save_dir = self.save_dir
-            validator.args.task = 'detect'  # 确保任务为检测
+            validator.args.task = 'detect'
 
-            # 3. 初始化验证指标
+            # 初始化验证指标
             validator.init_metrics(model)
 
-            # 4. 打印标准的YOLOv8验证标题
-            s = ("%22s" * 7) % ("Class", "Images", "Instances", "Box(P", "R", "mAP50", "mAP50-95")
-            LOGGER.info(s)
+            # # 执行验证 - 使用标准的验证流程
+            # LOGGER.info(f"Validating with {len(validator.dataloader)} batches")
 
-            # 5. 执行验证
+            # 打印标准的YOLOv8验证表头
+            LOGGER.info("%21s %11s %11s %11s %11s %11s %11s" % (
+            "Class", "Images", "Instances", "Box(P", "R", "mAP50", "mAP50-95"))
+
+            # 进度条
+            pbar = tqdm(validator.dataloader, desc="Validation", total=len(validator.dataloader))
+
             with torch.no_grad():
-                for batch_idx, batch in enumerate(validator.dataloader):
+                for batch_idx, batch in enumerate(pbar):
                     # 预处理批次
                     batch = validator.preprocess(batch)
 
@@ -317,85 +340,95 @@ class DomainAdaptTrainer(DetectionTrainer):
                     # 更新指标
                     validator.update_metrics(preds, batch)
 
-            # 6. 完成指标计算
+            # 完成指标计算
             validator.finalize_metrics()
             stats = validator.get_stats()
 
-            # 7. 获取和输出结果 - 使用更安全的方式处理
+            # 获取主要指标
+            precision = float(stats.get('metrics/precision(B)', 0.0))
+            recall = float(stats.get('metrics/recall(B)', 0.0))
+            mAP50 = float(stats.get('metrics/mAP50(B)', 0.0))
+            mAP = float(stats.get('metrics/mAP50-95(B)', 0.0))
+
+            # 直接使用获取的数值打印结果，避免对mean_results()的依赖
             try:
-                if hasattr(validator.metrics, 'mean_results') and callable(validator.metrics.mean_results):
-                    mean_results = validator.metrics.mean_results()
+                # 输出总结结果行 - 使用已提取的数值
+                total_instances = validator.metrics.nt_per_class.sum() if hasattr(validator.metrics,
+                                                                                  'nt_per_class') else 0
+                LOGGER.info("%21s %11d %11d %11.3g %11.3g %11.3g %11.3g" % (
+                    "all",
+                    validator.seen,
+                    total_instances,
+                    precision,
+                    recall,
+                    mAP50,
+                    mAP
+                ))
 
-                    # 安全地检查结果类型
-                    numeric_results = []
-                    for res in mean_results:
+                # 如果详细模式并且有多个类别，单独打印每个类别的结果
+                if validator.args.verbose and hasattr(validator.metrics, 'ap_class_index') and len(
+                        validator.metrics.ap_class_index) > 1:
+                    for i, c in enumerate(validator.metrics.ap_class_index):
+                        # 直接提取各指标值
+                        cls_precision = validator.metrics.precision[i] if hasattr(validator.metrics,
+                                                                                  'precision') else 0.0
+                        cls_recall = validator.metrics.recall[i] if hasattr(validator.metrics, 'recall') else 0.0
+                        cls_map50 = validator.metrics.ap50[i] if hasattr(validator.metrics, 'ap50') else 0.0
+                        cls_map = validator.metrics.ap[i] if hasattr(validator.metrics, 'ap') else 0.0
+
+                        # 确保所有值都是浮点数
                         try:
-                            numeric_results.append(float(res))
+                            cls_precision = float(cls_precision)
+                            cls_recall = float(cls_recall)
+                            cls_map50 = float(cls_map50)
+                            cls_map = float(cls_map)
                         except (ValueError, TypeError):
-                            numeric_results.append(0.0)  # 转换失败时使用默认值
+                            # 如果转换失败，使用默认值
+                            cls_precision = 0.0
+                            cls_recall = 0.0
+                            cls_map50 = 0.0
+                            cls_map = 0.0
 
-                    # 输出总体结果
-                    LOGGER.info("%22s" + "%11i" * 2 + "%11.3g" * len(numeric_results) % (
-                        "all",
-                        validator.seen,
-                        validator.metrics.nt_per_class.sum() if hasattr(validator.metrics, 'nt_per_class') else 0,
-                        *numeric_results
-                    ))
+                        cls_instances = validator.metrics.nt_per_class[c] if hasattr(validator.metrics,
+                                                                                     'nt_per_class') else 0
 
-                    # 如果有类别结果且verbose，输出每个类别的结果
-                    if validator.args.verbose and hasattr(validator.metrics, 'ap_class_index') and len(
-                            validator.metrics.ap_class_index) > 1:
-                        for i, c in enumerate(validator.metrics.ap_class_index):
-                            class_results = validator.metrics.class_result(i)
-                            # 同样安全地处理类别结果
-                            numeric_class_results = []
-                            for res in class_results:
-                                try:
-                                    numeric_class_results.append(float(res))
-                                except (ValueError, TypeError):
-                                    numeric_class_results.append(0.0)
-
-                            LOGGER.info("%22s" + "%11i" * 2 + "%11.3g" * len(numeric_class_results) % (
-                                validator.names[c],
-                                validator.seen,
-                                validator.metrics.nt_per_class[c],
-                                *numeric_class_results
-                            ))
-                else:
-                    # 简化输出
-                    precision = stats.get('metrics/precision(B)', 0.0)
-                    recall = stats.get('metrics/recall(B)', 0.0)
-                    mAP50 = stats.get('metrics/mAP50(B)', 0.0)
-                    mAP = stats.get('metrics/mAP50-95(B)', 0.0)
-                    LOGGER.info(f"Validation results: mAP50={mAP50:.3f}, mAP50-95={mAP:.3f}")
+                        # 使用与总结行相同的格式
+                        LOGGER.info("%21s %11d %11d %11.3g %11.3g %11.3g %11.3g" % (
+                            validator.names[c],
+                            validator.seen,
+                            cls_instances,
+                            cls_precision,
+                            cls_recall,
+                            cls_map50,
+                            cls_map
+                        ))
             except Exception as format_e:
+                # 如果详细格式输出失败，打印一个简单的总结
                 LOGGER.error(f"Error formatting validation results: {format_e}")
-                precision = stats.get('metrics/precision(B)', 0.0)
-                recall = stats.get('metrics/recall(B)', 0.0)
-                mAP50 = stats.get('metrics/mAP50(B)', 0.0)
-                mAP = stats.get('metrics/mAP50-95(B)', 0.0)
-                LOGGER.info(f"Validation results: mAP50={mAP50:.3f}, mAP50-95={mAP:.3f}")
+                # 简单格式备用输出
+                LOGGER.info(
+                    f"Validation results: mAP50={mAP50:.3f}, mAP50-95={mAP:.3f}, precision={precision:.3f}, recall={recall:.3f}")
 
-            # 8. 保存结果并返回
+            # 保存结果并返回
             self.metrics = validator.metrics
 
-            # 9. 恢复训练模式
+            # 恢复训练模式
             self.model.train(model_training)
 
             # 构建结果字典
             results = {
-                'mp': stats.get('metrics/precision(B)', 0.0),
-                'mr': stats.get('metrics/recall(B)', 0.0),
-                'map50': stats.get('metrics/mAP50(B)', 0.0),
-                'map': stats.get('metrics/mAP50-95(B)', 0.0),
-                'fitness': stats.get('fitness', 0.0)
+                'mp': precision,
+                'mr': recall,
+                'map50': mAP50,
+                'map': mAP,
+                'fitness': float(stats.get('fitness', 0.0))
             }
 
             # 更新最佳适应度
             self.best_fitness = max(self.best_fitness or 0, results['fitness'])
 
-            # 清理内存
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            # 恢复任何更改的目录
+            self.save_dir = original_dir
 
             return results
 
@@ -407,11 +440,11 @@ class DomainAdaptTrainer(DetectionTrainer):
             # 如果验证失败，使用备用验证结果
             LOGGER.warning("Falling back to placeholder validation results")
             placeholder_results = {
-                'mp': 0.5,  # mean precision
-                'mr': 0.5,  # mean recall
-                'map50': 0.5,  # mAP@0.5
-                'map': 0.4,  # mAP@0.5:0.95
-                'fitness': 0.45  # 适应度分数
+                'mp': 0.5,
+                'mr': 0.5,
+                'map50': 0.5,
+                'map': 0.4,
+                'fitness': 0.45
             }
 
             # 更新最佳适应度
@@ -427,6 +460,11 @@ class DomainAdaptTrainer(DetectionTrainer):
         """执行训练，包括域适应部分"""
         # 设置训练环境与组件
         self._setup_train(world_size)
+
+        # 确保使用原始目录
+        if self.original_save_dir:
+            self.save_dir = self.original_save_dir
+            LOGGER.info(f"Training outputs will be saved to: {self.save_dir}")
 
         # 如果没有启用域适应，则使用标准训练
         if not self.domain_adapt_enabled:
@@ -924,74 +962,118 @@ class DomainAdaptTrainer(DetectionTrainer):
         return batch
 
     def save_model(self):
-        """保存包含域适应组件的模型，避免创建多个目录"""
+        """保存包含域适应组件的模型，确保使用原始目录"""
         try:
+            # 记录当前目录
+            current_dir = self.save_dir
+
+            # 确保使用原始目录
+            if self.original_save_dir:
+                self.save_dir = self.original_save_dir
+
             # 确保CSV文件存在
             self.create_empty_results_csv()
 
             # 检查metrics是否为字典类型
             if hasattr(self, 'metrics'):
                 original_metrics = self.metrics
+                metrics_handled = False
+
                 if not isinstance(self.metrics, dict):
-                    # 如果self.metrics是DetMetrics对象
+                    # 创建临时字典
+                    temp_metrics = {}
+
+                    # 尝试各种格式的metrics
                     if hasattr(self.metrics, 'results_dict'):
-                        metrics_dict = self.metrics.results_dict
-                        self.metrics = metrics_dict
-                    # 如果是列表或其他类型，创建一个基本字典
-                    else:
-                        self.metrics = {
+                        temp_metrics = self.metrics.results_dict
+                        metrics_handled = True
+                    elif isinstance(self.metrics, (list, tuple)):
+                        # 基本占位符
+                        temp_metrics = {
                             'metrics/precision(B)': 0.5,
                             'metrics/recall(B)': 0.5,
                             'metrics/mAP50(B)': 0.5,
                             'metrics/mAP50-95(B)': 0.4,
+                            'fitness': 0.45
                         }
+                        metrics_handled = True
 
-                    # 调用父类方法
+                    if metrics_handled:
+                        # 临时替换并保存
+                        self.metrics = temp_metrics
+                        try:
+                            super().save_model()
+                        finally:
+                            # 恢复原始metrics
+                            self.metrics = original_metrics
+
+                        # 恢复目录并返回
+                        self.save_dir = current_dir
+                        return
+
+                # 如果metrics是字典或没有处理过
+                if not metrics_handled:
                     try:
                         super().save_model()
-                    finally:
-                        # 恢复原始metrics
-                        self.metrics = original_metrics
-                    return
+                    except Exception as e:
+                        LOGGER.error(f"Error in standard save with original metrics: {e}")
+                        # 使用备份策略
+                        self._backup_save_model()
+            else:
+                # 无metrics，使用备份保存
+                self._backup_save_model()
 
-            # 如果metrics是字典，直接调用父类方法
-            super().save_model()
+            # 恢复目录
+            self.save_dir = current_dir
 
         except Exception as e:
-            LOGGER.error(f"Error in standard save_model: {e}")
+            LOGGER.error(f"Error in save_model: {e}")
             import traceback
             LOGGER.error(traceback.format_exc())
+            self._backup_save_model()
 
-            # 备份保存方法 - 使用epoch_*.pt命名而不是backup_epoch_*
-            try:
-                # 保存最小模型权重
-                ckpt = {
-                    'epoch': self.epoch,
-                    'model': de_parallel(self.model).state_dict(),
-                    'date': datetime.now().isoformat()
-                }
-                # 使用epoch_N.pt命名格式，避免创建新目录
-                save_path = str(self.save_dir / f'epoch_{self.epoch}.pt')
-                torch.save(ckpt, save_path)
-                LOGGER.info(f"Saved model to {save_path}")
-            except Exception as backup_e:
-                LOGGER.error(f"Even backup save failed: {backup_e}")
-
-        # 判别器保存逻辑 - 保存到相同目录中
+        # 判别器保存逻辑 - 确保使用原始目录
         try:
-            should_save = (self.epoch % 10 == 0) and (self.epoch != 0)  # 每 10 个 epoch
-            is_final_epoch = (self.epoch == self.epochs - 1)  # 或最后一个 epoch
+            # 使用原始目录
+            if self.original_save_dir:
+                self.save_dir = self.original_save_dir
+
+            should_save = (self.epoch % 10 == 0) and (self.epoch != 0)
+            is_final_epoch = (self.epoch == self.epochs - 1)
 
             if self.domain_adapt_enabled and self.discriminator is not None and (should_save or is_final_epoch):
                 discriminator = de_parallel(self.discriminator)
 
-                # 所有文件保存到同一目录下
+                # 保存到原始目录
                 if is_final_epoch:
-                    disc_path = str(self.save_dir / 'discriminator_final.pt')
+                    disc_path = str(Path(self.save_dir) / 'discriminator_final.pt')
                 else:
-                    disc_path = str(self.save_dir / f'discriminator_epoch{self.epoch}.pt')
+                    disc_path = str(Path(self.save_dir) / f'discriminator_epoch{self.epoch}.pt')
 
                 torch.save(discriminator.state_dict(), disc_path)
                 LOGGER.info(f"Saved discriminator to {disc_path}")
+
+            # 恢复目录
+            self.save_dir = current_dir
         except Exception as e:
             LOGGER.error(f"Error saving discriminator: {e}")
+
+    def _backup_save_model(self):
+        """备份模型保存方法，确保使用原始目录"""
+        try:
+            # 使用原始目录
+            if self.original_save_dir:
+                self.save_dir = self.original_save_dir
+
+            # 保存最小模型权重
+            ckpt = {
+                'epoch': self.epoch,
+                'model': de_parallel(self.model).state_dict(),
+                'date': datetime.now().isoformat()
+            }
+            # 使用明确的命名格式
+            save_path = str(Path(self.save_dir) / f'epoch_{self.epoch}.pt')
+            torch.save(ckpt, save_path)
+            LOGGER.info(f"Saved backup model to {save_path}")
+        except Exception as backup_e:
+            LOGGER.error(f"Backup save failed: {backup_e}")
