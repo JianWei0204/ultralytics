@@ -204,19 +204,20 @@ class DomainAdaptTrainer(DetectionTrainer):
                 raise
 
     def create_empty_results_csv(self):
-        """创建空的results.csv文件，如果它不存在"""
+        """创建空的results.csv文件，如果它不存在 - 修正列名"""
         if not os.path.exists(self.csv):
             LOGGER.warning(f"Results file {self.csv} not found. Creating empty results file.")
             # 确保目录存在
             os.makedirs(os.path.dirname(self.csv), exist_ok=True)
-            # 创建一个空的results.csv文件
-            columns = ['epoch', 'train/box_loss', 'train/cls_loss', 'train/dfl_loss',
+            # 创建一个空的results.csv文件 - 修正列名
+            columns = ['epoch', 'time', 'train/box_loss', 'train/cls_loss', 'train/dfl_loss',
                        'metrics/precision(B)', 'metrics/recall(B)', 'metrics/mAP50(B)',
                        'metrics/mAP50-95(B)', 'val/box_loss', 'val/cls_loss', 'val/dfl_loss',
-                       'lr/0', 'lr/1', 'lr/2']
+                       'lr/pg0', 'lr/pg1', 'lr/pg2']  # 正确的列名
             # 创建空的DataFrame并保存
             pd.DataFrame(columns=columns).to_csv(self.csv, index=False)
             LOGGER.info(f"Created empty results file at {self.csv}")
+
 
     def setup_discriminator(self):
         """初始化域判别器及其优化器"""
@@ -741,13 +742,19 @@ class DomainAdaptTrainer(DetectionTrainer):
                     else:
                         gc.collect()
 
+            # 计算训练损失均值
+            self.box_loss = self.tloss[0].item() / len(self.train_loader)
+            self.cls_loss = self.tloss[1].item() / len(self.train_loader)
+            self.dfl_loss = self.tloss[2].item() / len(self.train_loader)
+
+            # 记录epoch结束时间
+            self.epoch_time = time.time() - self.epoch_start_time
+
             # 处理每个epoch结束时的操作
             self.run_callbacks('on_train_epoch_end')
 
-            # 计算并记录每个epoch的结果
-            self.on_train_epoch_end()
-
-            # 执行验证 - 强化版错误处理
+            # 执行验证 - 修改:直接保存验证结果并立即更新CSV
+            val_results = None
             try:
                 # 显式设置当前epoch属性以确保验证可以访问
                 self.epoch = epoch
@@ -779,21 +786,26 @@ class DomainAdaptTrainer(DetectionTrainer):
                 # 验证间隔检查
                 val_interval = getattr(self.args, 'val_interval', 1)  # 如果不存在，默认为1
                 if (epoch + 1) % val_interval == 0:
-                    self.validate()
-            except AttributeError as e:
-                # 如果val_interval不存在或其他属性错误
-                LOGGER.warning(f"AttributeError during validation: {e}")
-                LOGGER.warning("'val_interval' not found in configuration, using default value of 1")
-                try:
-                    self.validate()
-                except Exception as val_e:
-                    LOGGER.error(f"Validation failed: {val_e}")
-                    import traceback
-                    LOGGER.error(traceback.format_exc())
+                    val_results = self.validate()  # 保存验证结果
+
+                    # 重要改动：在验证后立即更新CSV，确保验证结果与当前epoch对应
+                    self.update_results_csv(epoch, val_results)
+
+                    # 生成或更新图表
+                    self.plot_results()
+                else:
+                    # 如果这个epoch不执行验证，仍需更新CSV，但不包含验证数据
+                    self.update_results_csv(epoch, None)
+                    self.plot_results()
+
             except Exception as e:
                 LOGGER.error(f"Error during validation: {e}")
                 import traceback
                 LOGGER.error(traceback.format_exc())
+
+                # 即使验证失败，也要更新CSV
+                self.update_results_csv(epoch, None)
+                self.plot_results()
 
             # 保存模型 - 强化错误处理
             try:
@@ -1102,13 +1114,13 @@ class DomainAdaptTrainer(DetectionTrainer):
             except Exception as inner_e:
                 LOGGER.error(f"Emergency save failed: {inner_e}")
 
-    def update_results_csv(self, epoch, results, metrics):
-        """在每个epoch后更新results.csv文件"""
+    def update_results_csv(self, epoch, validation_results=None):
+        """在每个epoch后更新results.csv文件，确保与标准YOLOv8格式完全一致"""
         try:
             # 确保results.csv文件存在
             csv_path = Path(self.save_dir) / "results.csv"
             if not csv_path.exists():
-                # 创建CSV文件头，确保与标准YOLOv8格式一致
+                # 创建CSV文件头，确保与标准YOLOv8格式完全一致
                 header = ["epoch", "time", "train/box_loss", "train/cls_loss", "train/dfl_loss",
                           "metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)",
                           "val/box_loss", "val/cls_loss", "val/dfl_loss",
@@ -1121,7 +1133,7 @@ class DomainAdaptTrainer(DetectionTrainer):
             # 收集本轮结果
             row = []
             row.append(f"{epoch + 1}")  # epoch
-            row.append(f"{self.epoch_time:.4f}")  # time
+            row.append(f"{self.epoch_time:.4f}")  # time - 确保时间列被填充
 
             # 训练损失
             for loss_name in ["box_loss", "cls_loss", "dfl_loss"]:
@@ -1130,29 +1142,76 @@ class DomainAdaptTrainer(DetectionTrainer):
                 else:
                     row.append("")
 
-            # 评估指标
-            for metric_name in ["metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)"]:
-                if metric_name in metrics:
-                    row.append(f"{metrics[metric_name]:.5f}")
-                else:
-                    # 尝试提取metrics对象中的值
-                    if hasattr(metrics, 'results_dict'):
-                        clean_name = metric_name.split('/')[-1].replace('(B)', '')
-                        if clean_name in metrics.results_dict:
-                            row.append(f"{metrics.results_dict[clean_name]:.5f}")
-                        else:
-                            row.append("")
-                    else:
-                        row.append("")
+            # 评估指标 - 从验证结果获取
+            metrics_dict = {}
+            if validation_results is not None and isinstance(validation_results, dict):
+                # 直接使用验证函数返回的结果
+                metrics_dict = {
+                    "metrics/precision(B)": validation_results.get('mp', 0.0),
+                    "metrics/recall(B)": validation_results.get('mr', 0.0),
+                    "metrics/mAP50(B)": validation_results.get('map50', 0.0),
+                    "metrics/mAP50-95(B)": validation_results.get('map', 0.0),
+                }
+            elif hasattr(self, 'metrics') and self.metrics is not None:
+                if isinstance(self.metrics, dict):
+                    metrics_dict = self.metrics
+                elif hasattr(self.metrics, 'results_dict'):
+                    results = self.metrics.results_dict
+                    metrics_dict = {
+                        "metrics/precision(B)": results.get('precision', 0.0),
+                        "metrics/recall(B)": results.get('recall', 0.0),
+                        "metrics/mAP50(B)": results.get('mAP50', 0.0),
+                        "metrics/mAP50-95(B)": results.get('mAP50-95', 0.0),
+                    }
 
-            # 验证损失
+            # 添加评估指标
+            for metric_name in ["metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)"]:
+                row.append(f"{metrics_dict.get(metric_name, 0.0):.5f}")
+
+            # 验证损失 - 尝试从多个来源获取
+            val_losses = {}
+
+            # 1. 首先尝试从validation_results获取
+            if validation_results is not None and isinstance(validation_results, dict):
+                if 'val/box_loss' in validation_results:
+                    val_losses["val/box_loss"] = validation_results['val/box_loss']
+                if 'val/cls_loss' in validation_results:
+                    val_losses["val/cls_loss"] = validation_results['val/cls_loss']
+                if 'val/dfl_loss' in validation_results:
+                    val_losses["val/dfl_loss"] = validation_results['val/dfl_loss']
+
+            # 2. 尝试从validator对象获取
+            if not val_losses and hasattr(self, 'validator') and self.validator is not None:
+                # 如果验证器有损失信息，提取它们
+                if hasattr(self.validator, 'loss_items') and self.validator.loss_items is not None:
+                    items = self.validator.loss_items
+                    if len(items) >= 3:
+                        val_losses["val/box_loss"] = float(items[0])
+                        val_losses["val/cls_loss"] = float(items[1])
+                        val_losses["val/dfl_loss"] = float(items[2])
+                elif hasattr(self.validator, 'loss') and self.validator.loss is not None:
+                    val_losses["val/box_loss"] = float(self.validator.loss)
+
+            # 3. 从metrics对象获取
+            if hasattr(self, 'metrics') and self.metrics is not None:
+                # 尝试从metrics.results_dict获取验证损失
+                if hasattr(self.metrics, 'results_dict'):
+                    results = self.metrics.results_dict
+                    if 'box_loss' in results and 'val/box_loss' not in val_losses:
+                        val_losses["val/box_loss"] = results['box_loss']
+                    if 'cls_loss' in results and 'val/cls_loss' not in val_losses:
+                        val_losses["val/cls_loss"] = results['cls_loss']
+                    if 'dfl_loss' in results and 'val/dfl_loss' not in val_losses:
+                        val_losses["val/dfl_loss"] = results['dfl_loss']
+
+            # 添加验证损失 - 确保所有三列都有值，即使是空值
             for val_loss_name in ["val/box_loss", "val/cls_loss", "val/dfl_loss"]:
-                if val_loss_name in metrics:
-                    row.append(f"{metrics[val_loss_name]:.5f}")
+                if val_loss_name in val_losses:
+                    row.append(f"{val_losses[val_loss_name]:.5f}")
                 else:
                     row.append("")
 
-            # 学习率
+            # 学习率 - 使用正确的列名 lr/pg0, lr/pg1, lr/pg2
             for i, pg in enumerate(self.optimizer.param_groups[:3]):
                 row.append(f"{pg['lr']:.8f}")
 
@@ -1169,7 +1228,7 @@ class DomainAdaptTrainer(DetectionTrainer):
             LOGGER.error(traceback.format_exc())
 
     def plot_results(self):
-        """生成训练结果图表"""
+        """生成训练结果图表 - 增强处理缺失数据和转换数据类型的能力"""
         try:
             csv_path = Path(self.save_dir) / "results.csv"
             if not csv_path.exists():
@@ -1214,28 +1273,40 @@ class DomainAdaptTrainer(DetectionTrainer):
 
             # 绘制每个指标
             for i, (metric_name, title) in enumerate(metrics):
+                ax = axs[i]
+                ax.set_title(title)
+                ax.set_xlabel('epoch')
+                ax.grid(True)
+
                 if metric_name in data.columns:
-                    ax = axs[i]
-                    metric_data = data[metric_name].astype(float)
+                    # 安全转换为数值，处理空值和非数值
+                    metric_data = pd.to_numeric(data[metric_name], errors='coerce')
 
-                    # 绘制原始数据
-                    ax.plot(np.arange(1, len(data) + 1), metric_data, marker='.', label='results', linewidth=2,
-                            markersize=8)
+                    # 过滤掉NaN值
+                    valid_indices = np.arange(1, len(data) + 1)[~metric_data.isna()]
+                    valid_data = metric_data[~metric_data.isna()]
 
-                    # 添加平滑线
-                    if len(data) > 1:
-                        try:
-                            # 使用移动平均进行平滑处理
-                            smoothed = metric_data.rolling(window=min(len(data) // 5 + 1, 10)).mean()
-                            ax.plot(np.arange(1, len(data) + 1), smoothed, 'r', label='smooth', linewidth=2)
-                        except Exception:
-                            pass
+                    if len(valid_data) > 0:
+                        # 绘制原始数据
+                        ax.plot(valid_indices, valid_data, marker='.', label='results', linewidth=2, markersize=8)
 
-                    ax.set_title(title)
-                    ax.set_xlabel('epoch')
-                    ax.grid(True)
-                    if i == 1:  # 只在第一个子图上添加图例
-                        ax.legend()
+                        # 添加平滑线
+                        if len(valid_data) > 5:  # 至少有5个点才进行平滑
+                            try:
+                                window_size = max(3, len(valid_data) // 10)  # 动态窗口大小
+                                smoothed = pd.Series(valid_data).rolling(window=window_size, center=False).mean()
+                                ax.plot(valid_indices, smoothed, 'r', label='smooth', linewidth=2)
+                            except Exception as e:
+                                LOGGER.warning(f"Error creating smoothed line for {metric_name}: {e}")
+
+                        if i == 0:  # 只在第一个图上添加图例
+                            ax.legend()
+                    else:
+                        ax.text(0.5, 0.5, "No valid data", horizontalalignment='center',
+                                verticalalignment='center', transform=ax.transAxes)
+                else:
+                    ax.text(0.5, 0.5, f"'{metric_name}' not found", horizontalalignment='center',
+                            verticalalignment='center', transform=ax.transAxes)
 
             # 调整布局和保存
             fig.tight_layout()
@@ -1250,8 +1321,9 @@ class DomainAdaptTrainer(DetectionTrainer):
             import traceback
             LOGGER.error(traceback.format_exc())
 
+    # 不再需要on_train_epoch_end中的update_results_csv和plot_results调用
     def on_train_epoch_end(self):
-        """每个训练epoch结束时的回调，更新CSV并生成图表"""
+        """每个训练epoch结束时的回调 - 简化为仅计算损失均值"""
         # 记录epoch结束时间
         self.epoch_time = time.time() - self.epoch_start_time
 
@@ -1260,26 +1332,4 @@ class DomainAdaptTrainer(DetectionTrainer):
         self.cls_loss = self.tloss[1].item() / len(self.train_loader)
         self.dfl_loss = self.tloss[2].item() / len(self.train_loader)
 
-        # 在训练epoch结束时，确保收集最新的metrics
-        metrics_dict = {}
-        if hasattr(self, 'metrics') and self.metrics is not None:
-            if isinstance(self.metrics, dict):
-                metrics_dict = self.metrics
-            elif hasattr(self.metrics, 'results_dict'):
-                metrics_dict = self.metrics.results_dict
-                # 转换为与标准YOLOv8格式一致的键名
-                keys_mapping = {
-                    'precision': 'metrics/precision(B)',
-                    'recall': 'metrics/recall(B)',
-                    'mAP50': 'metrics/mAP50(B)',
-                    'mAP50-95': 'metrics/mAP50-95(B)'
-                }
-                for old_key, new_key in keys_mapping.items():
-                    if old_key in metrics_dict:
-                        metrics_dict[new_key] = metrics_dict.pop(old_key)
-
-        # 更新CSV文件
-        self.update_results_csv(self.epoch, None, metrics_dict)
-
-        # 每个epoch结束时绘制图表
-        self.plot_results()
+        # 移除在此处更新CSV的代码，现在在验证后更新
