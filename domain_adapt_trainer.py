@@ -7,6 +7,10 @@ import os
 import yaml
 import gc
 import pandas as pd
+import csv
+import time
+import numpy as np
+import matplotlib.pyplot as plt
 from datetime import datetime
 from pathlib import Path
 from torch.utils.data import DataLoader
@@ -64,6 +68,14 @@ class DomainAdaptTrainer(DetectionTrainer):
 
         # 显式添加epoch属性
         self.epoch = 0
+
+        # 记录epoch开始时间
+        self.epoch_start_time = time.time()
+
+        # 训练损失
+        self.box_loss = 0.0
+        self.cls_loss = 0.0
+        self.dfl_loss = 0.0
 
     def setup_domain_adaptation(self, target_data, disc_lr=0.001):
         """设置域适应训练需要的参数和组件"""
@@ -475,6 +487,8 @@ class DomainAdaptTrainer(DetectionTrainer):
 
         # 开始训练循环
         for epoch in range(self.start_epoch, self.epochs):
+            # 记录epoch开始时间
+            self.epoch_start_time = time.time()
 
             # 确保设置为训练模式
             self.model.train()
@@ -515,8 +529,6 @@ class DomainAdaptTrainer(DetectionTrainer):
             else:
                 pbar = enumerate(self.train_loader)
 
-
-
             self.batch_i = 0
 
             # 创建目标域数据迭代器以便循环使用
@@ -524,6 +536,9 @@ class DomainAdaptTrainer(DetectionTrainer):
 
             # 计算每个批次的累积步数
             accumulate = max(round(self.args.nbs / self.batch_size), 1)
+
+            # 初始化训练损失累积器
+            self.tloss = torch.zeros(3, device=self.device)
 
             # 批次迭代
             for batch_idx, batch in pbar:
@@ -574,6 +589,9 @@ class DomainAdaptTrainer(DetectionTrainer):
                     dummy_param = next(self.model.parameters())
                     self.loss = dummy_param.sum() * 0 + 1.0
                     self.loss_items = torch.ones(3, device=self.device)
+
+                # 更新训练损失累积器
+                self.tloss += self.loss_items
 
                 # 标准反向传播与参数更新 - 使用try/except包装
                 try:
@@ -653,9 +671,6 @@ class DomainAdaptTrainer(DetectionTrainer):
                         # 反向传播更新特征提取器
                         G_target_loss.backward()
 
-                        # ===== 剩余代码保持不变 =====
-                        # ... 第2阶段：判别器训练...
-
                         # ===== 第2阶段：判别器训练 =====
                         # 解冻判别器参数
                         for param in self.discriminator.parameters():
@@ -728,6 +743,9 @@ class DomainAdaptTrainer(DetectionTrainer):
 
             # 处理每个epoch结束时的操作
             self.run_callbacks('on_train_epoch_end')
+
+            # 计算并记录每个epoch的结果
+            self.on_train_epoch_end()
 
             # 执行验证 - 强化版错误处理
             try:
@@ -864,7 +882,6 @@ class DomainAdaptTrainer(DetectionTrainer):
             )
             pbar.set_description(description)
 
-
     def preprocess_batch(self, batch):
         """预处理批次数据，并跟踪实例数量"""
         # 如果批次为空，则创建空字典
@@ -933,7 +950,7 @@ class DomainAdaptTrainer(DetectionTrainer):
         return batch
 
     def save_model(self):
-        """保存模型，修复None类型的fitness_value比较问题"""
+        """保存模型，仅保存到weights/子目录，只保留best.pt和last.pt"""
         try:
             # 记录当前目录
             current_dir = self.save_dir
@@ -1084,3 +1101,185 @@ class DomainAdaptTrainer(DetectionTrainer):
 
             except Exception as inner_e:
                 LOGGER.error(f"Emergency save failed: {inner_e}")
+
+    def update_results_csv(self, epoch, results, metrics):
+        """在每个epoch后更新results.csv文件"""
+        try:
+            # 确保results.csv文件存在
+            csv_path = Path(self.save_dir) / "results.csv"
+            if not csv_path.exists():
+                # 创建CSV文件头，确保与标准YOLOv8格式一致
+                header = ["epoch", "time", "train/box_loss", "train/cls_loss", "train/dfl_loss",
+                          "metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)",
+                          "val/box_loss", "val/cls_loss", "val/dfl_loss",
+                          "lr/pg0", "lr/pg1", "lr/pg2"]
+
+                with open(csv_path, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(header)
+
+            # 收集本轮结果
+            row = []
+            row.append(f"{epoch + 1}")  # epoch
+            row.append(f"{self.epoch_time:.4f}")  # time
+
+            # 训练损失
+            for loss_name in ["box_loss", "cls_loss", "dfl_loss"]:
+                if hasattr(self, loss_name):
+                    row.append(f"{getattr(self, loss_name):.5f}")
+                else:
+                    row.append("")
+
+            # 评估指标
+            for metric_name in ["metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)"]:
+                if metric_name in metrics:
+                    row.append(f"{metrics[metric_name]:.5f}")
+                else:
+                    # 尝试提取metrics对象中的值
+                    if hasattr(metrics, 'results_dict'):
+                        clean_name = metric_name.split('/')[-1].replace('(B)', '')
+                        if clean_name in metrics.results_dict:
+                            row.append(f"{metrics.results_dict[clean_name]:.5f}")
+                        else:
+                            row.append("")
+                    else:
+                        row.append("")
+
+            # 验证损失
+            for val_loss_name in ["val/box_loss", "val/cls_loss", "val/dfl_loss"]:
+                if val_loss_name in metrics:
+                    row.append(f"{metrics[val_loss_name]:.5f}")
+                else:
+                    row.append("")
+
+            # 学习率
+            for i, pg in enumerate(self.optimizer.param_groups[:3]):
+                row.append(f"{pg['lr']:.8f}")
+
+            # 追加到CSV文件
+            with open(csv_path, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+
+            LOGGER.info(f"Results saved to {csv_path}")
+
+        except Exception as e:
+            LOGGER.error(f"Error updating results CSV: {e}")
+            import traceback
+            LOGGER.error(traceback.format_exc())
+
+    def plot_results(self):
+        """生成训练结果图表"""
+        try:
+            csv_path = Path(self.save_dir) / "results.csv"
+            if not csv_path.exists():
+                LOGGER.warning(f"Results file {csv_path} not found, skipping plots")
+                return
+
+            # 导入必要的库
+            import pandas as pd
+            import matplotlib.pyplot as plt
+            import numpy as np
+
+            # 读取CSV文件
+            data = pd.read_csv(csv_path)
+
+            # 如果数据为空，则返回
+            if len(data) == 0:
+                LOGGER.warning("No data found in results.csv, skipping plots")
+                return
+
+            # 设置图表参数
+            plt.figure(figsize=(16, 10))
+            plt.rcParams.update({'font.size': 11})
+            plt.grid(True)
+
+            # 定义要绘制的指标
+            metrics = [
+                ("train/box_loss", "train/box_loss"),
+                ("train/cls_loss", "train/cls_loss"),
+                ("train/dfl_loss", "train/dfl_loss"),
+                ("metrics/precision(B)", "metrics/precision(B)"),
+                ("metrics/recall(B)", "metrics/recall(B)"),
+                ("val/box_loss", "val/box_loss"),
+                ("val/cls_loss", "val/cls_loss"),
+                ("val/dfl_loss", "val/dfl_loss"),
+                ("metrics/mAP50(B)", "metrics/mAP50(B)"),
+                ("metrics/mAP50-95(B)", "metrics/mAP50-95(B)")
+            ]
+
+            # 创建2x5子图布局
+            fig, axs = plt.subplots(2, 5, figsize=(20, 10))
+            axs = axs.flatten()
+
+            # 绘制每个指标
+            for i, (metric_name, title) in enumerate(metrics):
+                if metric_name in data.columns:
+                    ax = axs[i]
+                    metric_data = data[metric_name].astype(float)
+
+                    # 绘制原始数据
+                    ax.plot(np.arange(1, len(data) + 1), metric_data, marker='.', label='results', linewidth=2,
+                            markersize=8)
+
+                    # 添加平滑线
+                    if len(data) > 1:
+                        try:
+                            # 使用移动平均进行平滑处理
+                            smoothed = metric_data.rolling(window=min(len(data) // 5 + 1, 10)).mean()
+                            ax.plot(np.arange(1, len(data) + 1), smoothed, 'r', label='smooth', linewidth=2)
+                        except Exception:
+                            pass
+
+                    ax.set_title(title)
+                    ax.set_xlabel('epoch')
+                    ax.grid(True)
+                    if i == 1:  # 只在第一个子图上添加图例
+                        ax.legend()
+
+            # 调整布局和保存
+            fig.tight_layout()
+            save_path = Path(self.save_dir) / "results.png"
+            fig.savefig(save_path, dpi=200)
+            plt.close(fig)
+
+            LOGGER.info(f"Results plot saved to {save_path}")
+
+        except Exception as e:
+            LOGGER.error(f"Error plotting results: {e}")
+            import traceback
+            LOGGER.error(traceback.format_exc())
+
+    def on_train_epoch_end(self):
+        """每个训练epoch结束时的回调，更新CSV并生成图表"""
+        # 记录epoch结束时间
+        self.epoch_time = time.time() - self.epoch_start_time
+
+        # 计算平均损失
+        self.box_loss = self.tloss[0].item() / len(self.train_loader)
+        self.cls_loss = self.tloss[1].item() / len(self.train_loader)
+        self.dfl_loss = self.tloss[2].item() / len(self.train_loader)
+
+        # 在训练epoch结束时，确保收集最新的metrics
+        metrics_dict = {}
+        if hasattr(self, 'metrics') and self.metrics is not None:
+            if isinstance(self.metrics, dict):
+                metrics_dict = self.metrics
+            elif hasattr(self.metrics, 'results_dict'):
+                metrics_dict = self.metrics.results_dict
+                # 转换为与标准YOLOv8格式一致的键名
+                keys_mapping = {
+                    'precision': 'metrics/precision(B)',
+                    'recall': 'metrics/recall(B)',
+                    'mAP50': 'metrics/mAP50(B)',
+                    'mAP50-95': 'metrics/mAP50-95(B)'
+                }
+                for old_key, new_key in keys_mapping.items():
+                    if old_key in metrics_dict:
+                        metrics_dict[new_key] = metrics_dict.pop(old_key)
+
+        # 更新CSV文件
+        self.update_results_csv(self.epoch, None, metrics_dict)
+
+        # 每个epoch结束时绘制图表
+        self.plot_results()
