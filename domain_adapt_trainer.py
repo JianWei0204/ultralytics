@@ -271,7 +271,7 @@ class DomainAdaptTrainer(DetectionTrainer):
                 LOGGER.info(f'Discriminator learning rate adjusted to {current_lr:.6f}')
 
     def validate(self):
-        """执行标准YOLOv8验证过程，使用标准格式输出结果"""
+        """执行验证并将输出格式与训练部分保持一致"""
         try:
             # 记录原始保存目录
             original_dir = self.save_dir
@@ -280,14 +280,9 @@ class DomainAdaptTrainer(DetectionTrainer):
             if self.original_save_dir:
                 self.save_dir = self.original_save_dir
 
-            # 获取当前设备
+            # 获取当前设备并设置模型为评估模式
             device = next(self.model.parameters()).device
-            # LOGGER.info(f"Starting validation on device: {device}")
-
-            # 保存当前训练状态
             model_training = self.model.training
-
-            # 设置为评估模式
             self.model.eval()
 
             # 获取非并行版本的模型
@@ -297,7 +292,7 @@ class DomainAdaptTrainer(DetectionTrainer):
             # 创建DetectionValidator实例
             from ultralytics.models.yolo.detect import DetectionValidator
 
-            # 创建验证器实例并指定到原始保存目录
+            # 创建验证器实例
             validator = DetectionValidator(
                 dataloader=self.test_loader,
                 save_dir=self.save_dir,
@@ -305,7 +300,7 @@ class DomainAdaptTrainer(DetectionTrainer):
                 _callbacks=self.callbacks
             )
 
-            # 明确设置验证器的save_dir和其他属性
+            # 设置验证器属性
             validator.save_dir = self.save_dir
             validator.device = device
             validator.model = model
@@ -313,20 +308,39 @@ class DomainAdaptTrainer(DetectionTrainer):
             validator.data = self.data
             validator.args.task = 'detect'
 
+            # 关闭详细模式，只显示总结性结果
+            validator.args.verbose = False
+
             # 初始化验证指标
             validator.init_metrics(model)
 
-            # # 执行验证 - 使用标准的验证流程
-            # LOGGER.info(f"Validating with {len(validator.dataloader)} batches")
-
-            # 打印标准的YOLOv8验证表头
-            LOGGER.info("%21s %11s %11s %11s %11s %11s %11s" % (
-            "Class", "Images", "Instances", "Box(P", "R", "mAP50", "mAP50-95"))
-
-            # 进度条
-            pbar = tqdm(validator.dataloader, desc="Validation", total=len(validator.dataloader))
-
+            # 执行验证
             with torch.no_grad():
+                # 创建表头 - 使用与训练相同的格式化字符串
+                header = ("%11s" * 2 + "%11s" * 5) % (
+                    "Class",
+                    "Images",
+                    "Instances",
+                    "Box(P",
+                    "R",
+                    "mAP50",
+                    "mAP50-95"
+                )
+
+                # 使用与训练相同的进度条格式
+                if RANK in (-1, 0):
+                    pbar = tqdm(
+                        validator.dataloader,
+                        total=len(validator.dataloader),
+                        bar_format='{l_bar}{bar:20}{r_bar}',  # 增加进度条宽度
+                        unit='batch',
+                        ncols=200  # 显式设置更大的列宽
+                    )
+                    # 设置描述，这将显示在进度条前面
+                    pbar.set_description(header)
+                else:
+                    pbar = validator.dataloader
+
                 for batch_idx, batch in enumerate(pbar):
                     # 预处理批次
                     batch = validator.preprocess(batch)
@@ -340,9 +354,9 @@ class DomainAdaptTrainer(DetectionTrainer):
                     # 更新指标
                     validator.update_metrics(preds, batch)
 
-            # 完成指标计算
-            validator.finalize_metrics()
-            stats = validator.get_stats()
+                # 完成指标计算
+                validator.finalize_metrics()
+                stats = validator.get_stats()
 
             # 获取主要指标
             precision = float(stats.get('metrics/precision(B)', 0.0))
@@ -350,12 +364,12 @@ class DomainAdaptTrainer(DetectionTrainer):
             mAP50 = float(stats.get('metrics/mAP50(B)', 0.0))
             mAP = float(stats.get('metrics/mAP50-95(B)', 0.0))
 
-            # 直接使用获取的数值打印结果，避免对mean_results()的依赖
-            try:
-                # 输出总结结果行 - 使用已提取的数值
-                total_instances = validator.metrics.nt_per_class.sum() if hasattr(validator.metrics,
-                                                                                  'nt_per_class') else 0
-                LOGGER.info("%21s %11d %11d %11.3g %11.3g %11.3g %11.3g" % (
+            # 只打印"all"行的结果，使用与训练部分相同的格式
+            total_instances = validator.metrics.nt_per_class.sum() if hasattr(validator.metrics, 'nt_per_class') else 0
+
+            # 使用与表头相同的格式化字符串打印结果，确保对齐
+            if RANK in (-1, 0):
+                result_line = ("%11s" * 2 + "%11d" * 1 + "%11.3g" * 4) % (
                     "all",
                     validator.seen,
                     total_instances,
@@ -363,51 +377,8 @@ class DomainAdaptTrainer(DetectionTrainer):
                     recall,
                     mAP50,
                     mAP
-                ))
-
-                # 如果详细模式并且有多个类别，单独打印每个类别的结果
-                if validator.args.verbose and hasattr(validator.metrics, 'ap_class_index') and len(
-                        validator.metrics.ap_class_index) > 1:
-                    for i, c in enumerate(validator.metrics.ap_class_index):
-                        # 直接提取各指标值
-                        cls_precision = validator.metrics.precision[i] if hasattr(validator.metrics,
-                                                                                  'precision') else 0.0
-                        cls_recall = validator.metrics.recall[i] if hasattr(validator.metrics, 'recall') else 0.0
-                        cls_map50 = validator.metrics.ap50[i] if hasattr(validator.metrics, 'ap50') else 0.0
-                        cls_map = validator.metrics.ap[i] if hasattr(validator.metrics, 'ap') else 0.0
-
-                        # 确保所有值都是浮点数
-                        try:
-                            cls_precision = float(cls_precision)
-                            cls_recall = float(cls_recall)
-                            cls_map50 = float(cls_map50)
-                            cls_map = float(cls_map)
-                        except (ValueError, TypeError):
-                            # 如果转换失败，使用默认值
-                            cls_precision = 0.0
-                            cls_recall = 0.0
-                            cls_map50 = 0.0
-                            cls_map = 0.0
-
-                        cls_instances = validator.metrics.nt_per_class[c] if hasattr(validator.metrics,
-                                                                                     'nt_per_class') else 0
-
-                        # 使用与总结行相同的格式
-                        LOGGER.info("%21s %11d %11d %11.3g %11.3g %11.3g %11.3g" % (
-                            validator.names[c],
-                            validator.seen,
-                            cls_instances,
-                            cls_precision,
-                            cls_recall,
-                            cls_map50,
-                            cls_map
-                        ))
-            except Exception as format_e:
-                # 如果详细格式输出失败，打印一个简单的总结
-                LOGGER.error(f"Error formatting validation results: {format_e}")
-                # 简单格式备用输出
-                LOGGER.info(
-                    f"Validation results: mAP50={mAP50:.3f}, mAP50-95={mAP:.3f}, precision={precision:.3f}, recall={recall:.3f}")
+                )
+                LOGGER.info(result_line)
 
             # 保存结果并返回
             self.metrics = validator.metrics
@@ -427,7 +398,7 @@ class DomainAdaptTrainer(DetectionTrainer):
             # 更新最佳适应度
             self.best_fitness = max(self.best_fitness or 0, results['fitness'])
 
-            # 恢复任何更改的目录
+            # 恢复目录
             self.save_dir = original_dir
 
             return results
@@ -527,9 +498,9 @@ class DomainAdaptTrainer(DetectionTrainer):
                     "Size",
                 )
                 # 添加标题前后的分隔线
-                LOGGER.info("=" * len(s))
+                # LOGGER.info("=" * len(s))
                 LOGGER.info(s)
-                LOGGER.info("=" * len(s))
+                # LOGGER.info("=" * len(s))
 
             # # 设置进度条 - 使用tqdm直接创建
             if RANK in (-1, 0):

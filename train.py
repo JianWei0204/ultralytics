@@ -1,6 +1,6 @@
 from ultralytics import YOLO
 
-model = YOLO('ultralytics/cfg/models/yolov8-translayer.yaml')
+model = YOLO('ultralytics/cfg/models/v8/yolov8.yaml')
 # model = YOLO('yolov8/ultralytics/cfg/models/v8/yolov8.yaml')  # 使用YOLOv8n模型配置
 # 训练模型
 results = model.train(
