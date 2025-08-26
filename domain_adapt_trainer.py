@@ -933,7 +933,7 @@ class DomainAdaptTrainer(DetectionTrainer):
         return batch
 
     def save_model(self):
-        """保存包含域适应组件的模型，确保使用原始目录"""
+        """保存模型，修复None类型的fitness_value比较问题"""
         try:
             # 记录当前目录
             current_dir = self.save_dir
@@ -942,57 +942,116 @@ class DomainAdaptTrainer(DetectionTrainer):
             if self.original_save_dir:
                 self.save_dir = self.original_save_dir
 
+            # 确保weights子目录存在
+            weights_dir = Path(self.save_dir) / 'weights'
+            weights_dir.mkdir(exist_ok=True)
+
             # 确保CSV文件存在
             self.create_empty_results_csv()
 
-            # 检查metrics是否为字典类型
-            if hasattr(self, 'metrics'):
-                original_metrics = self.metrics
-                metrics_handled = False
+            # 获取非并行版本的模型
+            from ultralytics.utils.torch_utils import de_parallel
+            model = de_parallel(self.model)
 
-                if not isinstance(self.metrics, dict):
-                    # 创建临时字典
-                    temp_metrics = {}
+            # 创建基本检查点字典
+            ckpt = {
+                'epoch': self.epoch,
+                'best_fitness': self.best_fitness,
+                'model': model.state_dict(),
+                'optimizer': self.optimizer.state_dict(),
+                'ema': None if not hasattr(self, 'ema') or self.ema is None else self.ema.ema.state_dict(),
+                'updates': None if not hasattr(self, 'ema') or self.ema is None else self.ema.updates,
+                'opt': vars(self.args),
+                'date': datetime.now().isoformat()
+            }
 
-                    # 尝试各种格式的metrics
-                    if hasattr(self.metrics, 'results_dict'):
-                        temp_metrics = self.metrics.results_dict
-                        metrics_handled = True
-                    elif isinstance(self.metrics, (list, tuple)):
-                        # 基本占位符
-                        temp_metrics = {
-                            'metrics/precision(B)': 0.5,
-                            'metrics/recall(B)': 0.5,
-                            'metrics/mAP50(B)': 0.5,
-                            'metrics/mAP50-95(B)': 0.4,
-                            'fitness': 0.45
-                        }
-                        metrics_handled = True
+            # 1. 保存最后一个epoch的模型 (last.pt) - 仅保存到weights子目录
+            last_path = str(weights_dir / 'last.pt')
+            torch.save(ckpt, last_path)
+            LOGGER.info(f"Saved last model to {last_path}")
 
-                    if metrics_handled:
-                        # 临时替换并保存
-                        self.metrics = temp_metrics
-                        try:
-                            super().save_model()
-                        finally:
-                            # 恢复原始metrics
-                            self.metrics = original_metrics
+            # 2. 获取当前fitness值，处理None情况
+            fitness_value = None
+            if hasattr(self, 'fitness') and self.fitness is not None:
+                fitness_value = self.fitness
+            elif hasattr(self, 'metrics') and isinstance(self.metrics, dict):
+                fitness_value = self.metrics.get('fitness', None)
+            elif self.metrics is not None:
+                fitness_dict = getattr(self.metrics, 'results_dict', {})
+                fitness_value = fitness_dict.get('fitness', None)
 
-                        # 恢复目录并返回
-                        self.save_dir = current_dir
-                        return
+            # 打印当前和最佳fitness值
+            LOGGER.info(f"Current fitness: {fitness_value}, Best fitness: {self.best_fitness}")
 
-                # 如果metrics是字典或没有处理过
-                if not metrics_handled:
+            # 3. 保存最佳模型 (best.pt) - 安全比较，处理None情况
+            is_best = False
+
+            # 如果fitness_value为None，则不是最佳模型
+            # 如果fitness_value不是None，则与best_fitness比较
+            if fitness_value is not None and (self.best_fitness is None or fitness_value >= self.best_fitness):
+                is_best = True
+                self.best_fitness = fitness_value
+
+                # 保存best.pt - 仅保存到weights子目录
+                best_path = str(weights_dir / 'best.pt')
+                torch.save(ckpt, best_path)
+                LOGGER.info(f"New best model! Saved to {best_path} with fitness {self.best_fitness}")
+
+            # 4. 清理旧模型文件
+            # 清理根目录中的任何.pt文件
+            for pt_file in Path(self.save_dir).glob('*.pt'):
+                try:
+                    pt_file.unlink()
+                    LOGGER.info(f"Removed old checkpoint from root dir: {pt_file}")
+                except Exception as e:
+                    LOGGER.warning(f"Failed to remove {pt_file}: {e}")
+
+            # 清理weights目录中的旧epoch文件
+            for pt_file in weights_dir.glob('epoch_*.pt'):
+                try:
+                    pt_file.unlink()
+                    LOGGER.info(f"Removed old checkpoint: {pt_file}")
+                except Exception as e:
+                    LOGGER.warning(f"Failed to remove {pt_file}: {e}")
+
+            # 保存判别器 - 仅当域适应启用时
+            if self.domain_adapt_enabled and self.discriminator is not None:
+                discriminator = de_parallel(self.discriminator)
+
+                # 创建判别器检查点
+                disc_ckpt = {
+                    'epoch': self.epoch,
+                    'model': discriminator.state_dict(),
+                    'optimizer': self.optimizer_D.state_dict() if hasattr(self, 'optimizer_D') else None,
+                    'date': datetime.now().isoformat()
+                }
+
+                # 1. 保存最后一个epoch的判别器 (discriminator_last.pt) - 仅保存到weights子目录
+                disc_last_path = str(weights_dir / 'discriminator_last.pt')
+                torch.save(disc_ckpt, disc_last_path)
+                LOGGER.info(f"Saved last discriminator to {disc_last_path}")
+
+                # 2. 保存最佳判别器 (discriminator_best.pt) - 与主模型的best保持一致
+                if is_best:
+                    disc_best_path = str(weights_dir / 'discriminator_best.pt')
+                    torch.save(disc_ckpt, disc_best_path)
+                    LOGGER.info(f"Saved best discriminator to {disc_best_path}")
+
+                # 3. 清理其他判别器文件
+                for pt_file in Path(self.save_dir).glob('discriminator*.pt'):
                     try:
-                        super().save_model()
+                        pt_file.unlink()
+                        LOGGER.info(f"Removed old discriminator from root dir: {pt_file}")
                     except Exception as e:
-                        LOGGER.error(f"Error in standard save with original metrics: {e}")
-                        # 使用备份策略
-                        self._backup_save_model()
-            else:
-                # 无metrics，使用备份保存
-                self._backup_save_model()
+                        LOGGER.warning(f"Failed to remove {pt_file}: {e}")
+
+                # 清理weights目录中的旧epoch判别器文件
+                for pt_file in weights_dir.glob('discriminator_epoch*.pt'):
+                    try:
+                        pt_file.unlink()
+                        LOGGER.info(f"Removed old discriminator checkpoint: {pt_file}")
+                    except Exception as e:
+                        LOGGER.warning(f"Failed to remove {pt_file}: {e}")
 
             # 恢复目录
             self.save_dir = current_dir
@@ -1001,50 +1060,27 @@ class DomainAdaptTrainer(DetectionTrainer):
             LOGGER.error(f"Error in save_model: {e}")
             import traceback
             LOGGER.error(traceback.format_exc())
-            self._backup_save_model()
 
-        # 判别器保存逻辑 - 确保使用原始目录
-        try:
-            # 使用原始目录
-            if self.original_save_dir:
-                self.save_dir = self.original_save_dir
+            try:
+                # 简化的紧急保存 - 仅保存到weights子目录
+                from ultralytics.utils.torch_utils import de_parallel
+                model = de_parallel(self.model)
 
-            should_save = (self.epoch % 10 == 0) and (self.epoch != 0)
-            is_final_epoch = (self.epoch == self.epochs - 1)
+                # 确保weights目录存在
+                weights_dir = Path(self.save_dir) / 'weights'
+                weights_dir.mkdir(exist_ok=True)
 
-            if self.domain_adapt_enabled and self.discriminator is not None and (should_save or is_final_epoch):
-                discriminator = de_parallel(self.discriminator)
+                # 仅保存到weights目录
+                save_path = str(weights_dir / 'last.pt')
+                torch.save({'model': model.state_dict()}, save_path)
+                LOGGER.info(f"Emergency save completed to {save_path}")
 
-                # 保存到原始目录
-                if is_final_epoch:
-                    disc_path = str(Path(self.save_dir) / 'discriminator_final.pt')
-                else:
-                    disc_path = str(Path(self.save_dir) / f'discriminator_epoch{self.epoch}.pt')
+                # 保存判别器 - 仅保存到weights目录
+                if self.domain_adapt_enabled and self.discriminator is not None:
+                    discriminator = de_parallel(self.discriminator)
+                    disc_path = str(weights_dir / 'discriminator_last.pt')
+                    torch.save(discriminator.state_dict(), disc_path)
+                    LOGGER.info(f"Emergency discriminator save completed to {disc_path}")
 
-                torch.save(discriminator.state_dict(), disc_path)
-                LOGGER.info(f"Saved discriminator to {disc_path}")
-
-            # 恢复目录
-            self.save_dir = current_dir
-        except Exception as e:
-            LOGGER.error(f"Error saving discriminator: {e}")
-
-    def _backup_save_model(self):
-        """备份模型保存方法，确保使用原始目录"""
-        try:
-            # 使用原始目录
-            if self.original_save_dir:
-                self.save_dir = self.original_save_dir
-
-            # 保存最小模型权重
-            ckpt = {
-                'epoch': self.epoch,
-                'model': de_parallel(self.model).state_dict(),
-                'date': datetime.now().isoformat()
-            }
-            # 使用明确的命名格式
-            save_path = str(Path(self.save_dir) / f'epoch_{self.epoch}.pt')
-            torch.save(ckpt, save_path)
-            LOGGER.info(f"Saved backup model to {save_path}")
-        except Exception as backup_e:
-            LOGGER.error(f"Backup save failed: {backup_e}")
+            except Exception as inner_e:
+                LOGGER.error(f"Emergency save failed: {inner_e}")
