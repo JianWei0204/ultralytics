@@ -284,7 +284,7 @@ class DomainAdaptTrainer(DetectionTrainer):
                 LOGGER.info(f'Discriminator learning rate adjusted to {current_lr:.6f}')
 
     def validate(self):
-        """执行验证并将输出格式与训练部分保持一致"""
+        """执行验证并将输出格式与训练部分保持一致，同时收集验证损失"""
         try:
             # 记录原始保存目录
             original_dir = self.save_dir
@@ -327,6 +327,10 @@ class DomainAdaptTrainer(DetectionTrainer):
             # 初始化验证指标
             validator.init_metrics(model)
 
+            # 初始化验证损失累积器
+            val_loss_items = torch.zeros(3, device=device)
+            val_batch_count = 0
+
             # 执行验证
             with torch.no_grad():
                 # 创建表头 - 使用与训练相同的格式化字符串
@@ -345,11 +349,10 @@ class DomainAdaptTrainer(DetectionTrainer):
                     pbar = tqdm(
                         validator.dataloader,
                         total=len(validator.dataloader),
-                        bar_format='{l_bar}{bar:20}{r_bar}',  # 增加进度条宽度
+                        bar_format='{l_bar}{bar:20}{r_bar}',
                         unit='batch',
-                        ncols=200  # 显式设置更大的列宽
+                        ncols=200
                     )
-                    # 设置描述，这将显示在进度条前面
                     pbar.set_description(header)
                 else:
                     pbar = validator.dataloader
@@ -361,6 +364,15 @@ class DomainAdaptTrainer(DetectionTrainer):
                     # 模型推理
                     preds = validator.model(batch["img"])
 
+                    # 计算验证损失 - 使用相同的损失函数
+                    try:
+                        if hasattr(self, 'compute_loss') and self.compute_loss is not None:
+                            val_loss, val_loss_items_batch = self.compute_loss(preds, batch)
+                            val_loss_items += val_loss_items_batch
+                            val_batch_count += 1
+                    except Exception as e:
+                        LOGGER.warning(f"Could not compute validation loss: {e}")
+
                     # 后处理预测结果
                     preds = validator.postprocess(preds)
 
@@ -370,6 +382,10 @@ class DomainAdaptTrainer(DetectionTrainer):
                 # 完成指标计算
                 validator.finalize_metrics()
                 stats = validator.get_stats()
+
+            # 计算平均验证损失
+            if val_batch_count > 0:
+                val_loss_items = val_loss_items / val_batch_count
 
             # 获取主要指标
             precision = float(stats.get('metrics/precision(B)', 0.0))
@@ -399,13 +415,17 @@ class DomainAdaptTrainer(DetectionTrainer):
             # 恢复训练模式
             self.model.train(model_training)
 
-            # 构建结果字典
+            # 构建结果字典 - 包含验证损失
             results = {
                 'mp': precision,
                 'mr': recall,
                 'map50': mAP50,
                 'map': mAP,
-                'fitness': float(stats.get('fitness', 0.0))
+                'fitness': float(stats.get('fitness', 0.0)),
+                # 添加验证损失
+                'val/box_loss': float(val_loss_items[0]) if val_batch_count > 0 else 0.0,
+                'val/cls_loss': float(val_loss_items[1]) if val_batch_count > 0 else 0.0,
+                'val/dfl_loss': float(val_loss_items[2]) if val_batch_count > 0 else 0.0,
             }
 
             # 更新最佳适应度
@@ -428,7 +448,10 @@ class DomainAdaptTrainer(DetectionTrainer):
                 'mr': 0.5,
                 'map50': 0.5,
                 'map': 0.4,
-                'fitness': 0.45
+                'fitness': 0.45,
+                'val/box_loss': 0.0,
+                'val/cls_loss': 0.0,
+                'val/dfl_loss': 0.0,
             }
 
             # 更新最佳适应度
@@ -745,20 +768,18 @@ class DomainAdaptTrainer(DetectionTrainer):
             self.run_callbacks('on_train_epoch_end')
 
             # 计算训练损失均值
-            self.box_loss = self.tloss[0].item() / len(self.train_loader)
-            self.cls_loss = self.tloss[1].item() / len(self.train_loader)
-            self.dfl_loss = self.tloss[2].item() / len(self.train_loader)
+            if hasattr(self, 'tloss') and len(self.train_loader) > 0:
+                self.box_loss = float(self.tloss[0]) / len(self.train_loader)
+                self.cls_loss = float(self.tloss[1]) / len(self.train_loader)
+                self.dfl_loss = float(self.tloss[2]) / len(self.train_loader)
 
-            # 记录epoch结束时间
+                # 2. 记录epoch结束时间
             self.epoch_time = time.time() - self.epoch_start_time
 
-            # 执行验证 - 修改:直接保存验证结果并立即更新CSV
+            # 3. 执行验证并收集完整结果
             val_results = None
             try:
-                # 显式设置当前epoch属性以确保验证可以访问
                 self.epoch = epoch
-
-                # 确保验证前CSV文件存在
                 self.create_empty_results_csv()
 
                 # 验证前确保模型完全在GPU上
@@ -783,34 +804,18 @@ class DomainAdaptTrainer(DetectionTrainer):
                                         param.data = param.data.to(target_device)
 
                 # 验证间隔检查
-                val_interval = getattr(self.args, 'val_interval', 1)  # 如果不存在，默认为1
+                val_interval = getattr(self.args, 'val_interval', 1)
                 if (epoch + 1) % val_interval == 0:
-                    # 执行验证并捕获结果
+                    # 执行验证并获取包含验证损失的完整结果
                     val_results = self.validate()
 
-                    # 关键修改: 立即用验证结果更新CSV
-                    if val_results:
-                        # 准备验证损失数据
-                        validation_data = val_results.copy() if isinstance(val_results, dict) else {}
-
-                        # 如果验证器有损失信息，添加到结果中
-                        if hasattr(self, 'validator') and hasattr(self.validator, 'loss_items'):
-                            items = self.validator.loss_items
-                            if isinstance(items, torch.Tensor) and len(items) >= 3:
-                                validation_data['val/box_loss'] = float(items[0])
-                                validation_data['val/cls_loss'] = float(items[1])
-                                validation_data['val/dfl_loss'] = float(items[2])
-
-                        # 更新CSV文件
-                        self.update_results_csv(epoch, validation_data)
-                    else:
-                        # 即使没有验证结果，也更新训练数据
-                        self.update_results_csv(epoch, {})
+                    # 4. 立即更新CSV - 现在训练和验证数据都已准备好
+                    self.update_results_csv(epoch, val_results)
                 else:
-                    # 未执行验证的epoch也要更新训练数据
+                    # 未执行验证的epoch，只记录训练数据
                     self.update_results_csv(epoch, {})
 
-                # 生成图表
+                # 5. 生成图表
                 self.plot_results()
 
             except Exception as e:
@@ -1132,12 +1137,12 @@ class DomainAdaptTrainer(DetectionTrainer):
                 LOGGER.error(f"Emergency save failed: {inner_e}")
 
     def update_results_csv(self, epoch, validation_results=None):
-        """在每个epoch后更新results.csv文件，确保与标准YOLOv8格式完全一致"""
+        """在每个epoch后更新results.csv文件 - 修复数据不一致问题"""
         try:
             # 确保results.csv文件存在
             csv_path = Path(self.save_dir) / "results.csv"
             if not csv_path.exists():
-                # 创建CSV文件头，确保与标准YOLOv8格式完全一致
+                # 创建CSV文件头
                 header = ["epoch", "time", "train/box_loss", "train/cls_loss", "train/dfl_loss",
                           "metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)",
                           "val/box_loss", "val/cls_loss", "val/dfl_loss",
@@ -1150,85 +1155,45 @@ class DomainAdaptTrainer(DetectionTrainer):
             # 收集本轮结果
             row = []
             row.append(f"{epoch + 1}")  # epoch
-            row.append(f"{self.epoch_time:.4f}")  # time - 确保时间列被填充
+            row.append(f"{self.epoch_time:.4f}")  # time
 
-            # 训练损失
-            for loss_name in ["box_loss", "cls_loss", "dfl_loss"]:
-                if hasattr(self, loss_name):
-                    row.append(f"{getattr(self, loss_name):.5f}")
-                else:
-                    row.append("")
+            # 训练损失 - 使用正确计算的平均损失
+            row.append(f"{self.box_loss:.5f}")
+            row.append(f"{self.cls_loss:.5f}")
+            row.append(f"{self.dfl_loss:.5f}")
 
             # 评估指标 - 从验证结果获取
             metrics_dict = {}
             if validation_results is not None and isinstance(validation_results, dict):
-                # 直接使用验证函数返回的结果
                 metrics_dict = {
                     "metrics/precision(B)": validation_results.get('mp', 0.0),
                     "metrics/recall(B)": validation_results.get('mr', 0.0),
                     "metrics/mAP50(B)": validation_results.get('map50', 0.0),
                     "metrics/mAP50-95(B)": validation_results.get('map', 0.0),
                 }
-            elif hasattr(self, 'metrics') and self.metrics is not None:
-                if isinstance(self.metrics, dict):
-                    metrics_dict = self.metrics
-                elif hasattr(self.metrics, 'results_dict'):
-                    results = self.metrics.results_dict
-                    metrics_dict = {
-                        "metrics/precision(B)": results.get('precision', 0.0),
-                        "metrics/recall(B)": results.get('recall', 0.0),
-                        "metrics/mAP50(B)": results.get('mAP50', 0.0),
-                        "metrics/mAP50-95(B)": results.get('mAP50-95', 0.0),
-                    }
 
             # 添加评估指标
             for metric_name in ["metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)"]:
                 row.append(f"{metrics_dict.get(metric_name, 0.0):.5f}")
 
-            # 验证损失 - 尝试从多个来源获取
+            # 验证损失 - 直接从验证结果获取
             val_losses = {}
-
-            # 1. 首先尝试从validation_results获取
             if validation_results is not None and isinstance(validation_results, dict):
-                if 'val/box_loss' in validation_results:
-                    val_losses["val/box_loss"] = validation_results['val/box_loss']
-                if 'val/cls_loss' in validation_results:
-                    val_losses["val/cls_loss"] = validation_results['val/cls_loss']
-                if 'val/dfl_loss' in validation_results:
-                    val_losses["val/dfl_loss"] = validation_results['val/dfl_loss']
+                val_losses = {
+                    "val/box_loss": validation_results.get('val/box_loss', ''),
+                    "val/cls_loss": validation_results.get('val/cls_loss', ''),
+                    "val/dfl_loss": validation_results.get('val/dfl_loss', ''),
+                }
 
-            # 2. 尝试从validator对象获取
-            if not val_losses and hasattr(self, 'validator') and self.validator is not None:
-                # 如果验证器有损失信息，提取它们
-                if hasattr(self.validator, 'loss_items') and self.validator.loss_items is not None:
-                    items = self.validator.loss_items
-                    if len(items) >= 3:
-                        val_losses["val/box_loss"] = float(items[0])
-                        val_losses["val/cls_loss"] = float(items[1])
-                        val_losses["val/dfl_loss"] = float(items[2])
-                elif hasattr(self.validator, 'loss') and self.validator.loss is not None:
-                    val_losses["val/box_loss"] = float(self.validator.loss)
-
-            # 3. 从metrics对象获取
-            if hasattr(self, 'metrics') and self.metrics is not None:
-                # 尝试从metrics.results_dict获取验证损失
-                if hasattr(self.metrics, 'results_dict'):
-                    results = self.metrics.results_dict
-                    if 'box_loss' in results and 'val/box_loss' not in val_losses:
-                        val_losses["val/box_loss"] = results['box_loss']
-                    if 'cls_loss' in results and 'val/cls_loss' not in val_losses:
-                        val_losses["val/cls_loss"] = results['cls_loss']
-                    if 'dfl_loss' in results and 'val/dfl_loss' not in val_losses:
-                        val_losses["val/dfl_loss"] = results['dfl_loss']
-
-            # 添加验证损失 - 确保所有三列都有值，即使是空值
+            # 添加验证损失
             for val_loss_name in ["val/box_loss", "val/cls_loss", "val/dfl_loss"]:
-                if val_loss_name in val_losses:
-                    row.append(f"{val_losses[val_loss_name]:.5f}")
+                val_loss_value = val_losses.get(val_loss_name, '')
+                if val_loss_value != '' and val_loss_value is not None:
+                    row.append(f"{val_loss_value:.5f}")
                 else:
                     row.append("")
 
-            # 学习率 - 使用正确的列名 lr/pg0, lr/pg1, lr/pg2
+            # 学习率
             for i, pg in enumerate(self.optimizer.param_groups[:3]):
                 row.append(f"{pg['lr']:.8f}")
 
@@ -1338,15 +1303,18 @@ class DomainAdaptTrainer(DetectionTrainer):
             import traceback
             LOGGER.error(traceback.format_exc())
 
-    # 不再需要on_train_epoch_end中的update_results_csv和plot_results调用
     def on_train_epoch_end(self):
-        """每个训练epoch结束时的回调 - 简化为仅计算损失均值"""
+        """每个训练epoch结束时的回调 - 正确计算平均损失"""
         # 记录epoch结束时间
         self.epoch_time = time.time() - self.epoch_start_time
 
-        # 计算平均损失
-        self.box_loss = self.tloss[0].item() / len(self.train_loader)
-        self.cls_loss = self.tloss[1].item() / len(self.train_loader)
-        self.dfl_loss = self.tloss[2].item() / len(self.train_loader)
-
-        # 移除在此处更新CSV的代码，现在在验证后更新
+        # 正确计算平均损失 - 使用累积损失除以批次数
+        if hasattr(self, 'tloss') and len(self.train_loader) > 0:
+            self.box_loss = float(self.tloss[0]) / len(self.train_loader)
+            self.cls_loss = float(self.tloss[1]) / len(self.train_loader)
+            self.dfl_loss = float(self.tloss[2]) / len(self.train_loader)
+        else:
+            # 备用计算方法
+            self.box_loss = 0.0
+            self.cls_loss = 0.0
+            self.dfl_loss = 0.0
