@@ -564,6 +564,11 @@ class DomainAdaptTrainer(DetectionTrainer):
             # 初始化训练损失累积器
             self.tloss = torch.zeros(3, device=self.device)
 
+            # *** 新增：初始化当前epoch的损失记录变量 ***
+            self.current_epoch_box_loss = 0.0
+            self.current_epoch_cls_loss = 0.0
+            self.current_epoch_dfl_loss = 0.0
+
             # 批次迭代
             for batch_idx, batch in pbar:
                 self.batch_i = batch_idx
@@ -587,6 +592,11 @@ class DomainAdaptTrainer(DetectionTrainer):
                 try:
                     # 计算损失
                     self.loss, self.loss_items = self.compute_loss(preds, batch)
+
+                    # *** 关键修改：实时更新当前损失值，用于CSV记录 ***
+                    self.current_epoch_box_loss = float(self.loss_items[0])
+                    self.current_epoch_cls_loss = float(self.loss_items[1])
+                    self.current_epoch_dfl_loss = float(self.loss_items[2])
 
                     # 显示损失形状与信息 (调试)
                     # if batch_idx == 0:
@@ -767,13 +777,12 @@ class DomainAdaptTrainer(DetectionTrainer):
             # 处理每个epoch结束时的操作
             self.run_callbacks('on_train_epoch_end')
 
-            # 计算训练损失均值
-            if hasattr(self, 'tloss') and len(self.train_loader) > 0:
-                self.box_loss = float(self.tloss[0]) / len(self.train_loader)
-                self.cls_loss = float(self.tloss[1]) / len(self.train_loader)
-                self.dfl_loss = float(self.tloss[2]) / len(self.train_loader)
+            # *** 关键修改: 使用最后一个批次的实时损失值 ***
+            self.box_loss = self.current_epoch_box_loss
+            self.cls_loss = self.current_epoch_cls_loss
+            self.dfl_loss = self.current_epoch_dfl_loss
 
-                # 2. 记录epoch结束时间
+            # 记录epoch结束时间
             self.epoch_time = time.time() - self.epoch_start_time
 
             # 3. 执行验证并收集完整结果
