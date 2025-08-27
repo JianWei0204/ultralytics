@@ -741,6 +741,8 @@ class DomainAdaptTrainer(DetectionTrainer):
                         torch.cuda.empty_cache()
                     else:
                         gc.collect()
+            # 处理每个epoch结束时的操作
+            self.run_callbacks('on_train_epoch_end')
 
             # 计算训练损失均值
             self.box_loss = self.tloss[0].item() / len(self.train_loader)
@@ -749,9 +751,6 @@ class DomainAdaptTrainer(DetectionTrainer):
 
             # 记录epoch结束时间
             self.epoch_time = time.time() - self.epoch_start_time
-
-            # 处理每个epoch结束时的操作
-            self.run_callbacks('on_train_epoch_end')
 
             # 执行验证 - 修改:直接保存验证结果并立即更新CSV
             val_results = None
@@ -786,26 +785,44 @@ class DomainAdaptTrainer(DetectionTrainer):
                 # 验证间隔检查
                 val_interval = getattr(self.args, 'val_interval', 1)  # 如果不存在，默认为1
                 if (epoch + 1) % val_interval == 0:
-                    val_results = self.validate()  # 保存验证结果
+                    # 执行验证并捕获结果
+                    val_results = self.validate()
 
-                    # 重要改动：在验证后立即更新CSV，确保验证结果与当前epoch对应
-                    self.update_results_csv(epoch, val_results)
+                    # 关键修改: 立即用验证结果更新CSV
+                    if val_results:
+                        # 准备验证损失数据
+                        validation_data = val_results.copy() if isinstance(val_results, dict) else {}
 
-                    # 生成或更新图表
-                    self.plot_results()
+                        # 如果验证器有损失信息，添加到结果中
+                        if hasattr(self, 'validator') and hasattr(self.validator, 'loss_items'):
+                            items = self.validator.loss_items
+                            if isinstance(items, torch.Tensor) and len(items) >= 3:
+                                validation_data['val/box_loss'] = float(items[0])
+                                validation_data['val/cls_loss'] = float(items[1])
+                                validation_data['val/dfl_loss'] = float(items[2])
+
+                        # 更新CSV文件
+                        self.update_results_csv(epoch, validation_data)
+                    else:
+                        # 即使没有验证结果，也更新训练数据
+                        self.update_results_csv(epoch, {})
                 else:
-                    # 如果这个epoch不执行验证，仍需更新CSV，但不包含验证数据
-                    self.update_results_csv(epoch, None)
-                    self.plot_results()
+                    # 未执行验证的epoch也要更新训练数据
+                    self.update_results_csv(epoch, {})
+
+                # 生成图表
+                self.plot_results()
 
             except Exception as e:
-                LOGGER.error(f"Error during validation: {e}")
+                LOGGER.error(f"Error during validation or results recording: {e}")
                 import traceback
                 LOGGER.error(traceback.format_exc())
 
-                # 即使验证失败，也要更新CSV
-                self.update_results_csv(epoch, None)
-                self.plot_results()
+                # 即使出错，也尝试更新CSV
+                try:
+                    self.update_results_csv(epoch, {})
+                except Exception:
+                    pass
 
             # 保存模型 - 强化错误处理
             try:
