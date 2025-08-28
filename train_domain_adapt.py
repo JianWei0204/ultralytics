@@ -16,7 +16,7 @@ def parse_args():
     parser.add_argument('--imgsz', type=int, default=640, help='image size')
     parser.add_argument('--lr0', type=float, default=0.01, help='initial learning rate')
     parser.add_argument('--disc-lr', type=float, default=0.001, help='initial discriminator learning rate')
-    parser.add_argument('--weights', type=str, default=None, help='initial weights path')
+    parser.add_argument('--weights', type=str, default="yolov8n.pt", help='initial weights path')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--save-period', type=int, default=10, help='Save checkpoint every x epochs')
     return parser.parse_args()

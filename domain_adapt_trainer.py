@@ -127,7 +127,7 @@ class DomainAdaptTrainer(DetectionTrainer):
         # 如果启用了域适应，则设置相关组件
         if self.domain_adapt_enabled:
             # 创建特征提取器访问桥接层输出
-            self.feature_extractor = FeatureExtractor(self.model, 'Adjust_Transformer')
+            self.feature_extractor = FeatureExtractor(self.model, 'Adjust_Transformer')  # 假设桥接层是model.6
 
             # 将源域训练数据加载器保存为source_loader
             self.source_loader = self.train_loader
