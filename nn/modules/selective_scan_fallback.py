@@ -46,6 +46,9 @@ def selective_scan_fn(
     Returns:
         Output tensor of shape (batch, dim, seq_len)
     """
+    # Warn on first use
+    _warn_fallback()
+    
     batch, dim, seq_len = u.shape
     state_size = A.shape[1]
     
@@ -118,10 +121,17 @@ class SelectiveScanFallback:
         )
 
 
-# Warn user that fallback is being used
-warnings.warn(
-    "Using PyTorch fallback for selective_scan_cuda. "
-    "Performance will be significantly slower than the CUDA implementation. "
-    "Consider installing mamba-ssm with CUDA support for better performance.",
-    UserWarning
-)
+# Warning function to be called when fallback is actually used
+_warned = False
+
+def _warn_fallback():
+    """Warn user that fallback is being used (only once)."""
+    global _warned
+    if not _warned:
+        warnings.warn(
+            "Using PyTorch fallback for selective_scan_cuda. "
+            "Performance will be significantly slower than the CUDA implementation. "
+            "Consider installing mamba-ssm with CUDA support for better performance.",
+            UserWarning
+        )
+        _warned = True

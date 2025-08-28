@@ -34,6 +34,9 @@ def causal_conv1d_fn(
     Returns:
         Output tensor of shape (batch, out_channels, seq_len)
     """
+    # Warn on first use
+    _warn_fallback()
+    
     batch, in_channels, seq_len = x.shape
     out_channels, _, kernel_size = weight.shape
     
@@ -150,11 +153,6 @@ class CausalConv1dFallback(nn.Module):
 # Compatibility aliases to match the expected CUDA interface
 def causal_conv1d_cuda(*args, **kwargs):
     """Compatibility function that redirects to fallback implementation."""
-    warnings.warn(
-        "causal_conv1d_cuda not available, using PyTorch fallback. "
-        "Performance will be slower than the CUDA implementation.",
-        UserWarning
-    )
     return causal_conv1d_fn(*args, **kwargs)
 
 
@@ -163,10 +161,17 @@ def causal_conv1d_update_cuda(*args, **kwargs):
     return causal_conv1d_update(*args, **kwargs)
 
 
-# Warn user that fallback is being used  
-warnings.warn(
-    "Using PyTorch fallback for causal_conv1d_cuda. "
-    "Performance will be significantly slower than the CUDA implementation. "
-    "Consider installing causal-conv1d with CUDA support for better performance.",
-    UserWarning
-)
+# Warning function to be called when fallback is actually used
+_warned = False
+
+def _warn_fallback():
+    """Warn user that fallback is being used (only once)."""
+    global _warned
+    if not _warned:
+        warnings.warn(
+            "Using PyTorch fallback for causal_conv1d_cuda. "
+            "Performance will be significantly slower than the CUDA implementation. "
+            "Consider installing causal-conv1d with CUDA support for better performance.",
+            UserWarning
+        )
+        _warned = True
