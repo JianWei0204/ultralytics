@@ -11,12 +11,12 @@ def parse_args():
     parser.add_argument('--cfg', type=str, default='ultralytics/cfg/models/yolov8-translayer.yaml', help='model.yaml path')
     parser.add_argument('--source-data', type=str, default='/root/autodl-tmp/ultralytics/cfg/datasets/source_dataset.yaml', help='source domain dataset.yaml path')
     parser.add_argument('--target-data', type=str, default='/root/autodl-tmp/ultralytics/cfg/datasets/target_dataset.yaml', help='target domain dataset.yaml path')
-    parser.add_argument('--epochs', type=int, default=100, help='number of epochs')
+    parser.add_argument('--epochs', type=int, default=150, help='number of epochs')
     parser.add_argument('--batch-size', type=int, default=16, help='batch size')
     parser.add_argument('--imgsz', type=int, default=640, help='image size')
     parser.add_argument('--lr0', type=float, default=0.01, help='initial learning rate')
     parser.add_argument('--disc-lr', type=float, default=0.001, help='initial discriminator learning rate')
-    parser.add_argument('--weights', type=str, default="yolov8n.pt", help='initial weights path')
+    parser.add_argument('--pretrained', type=str, default="yolov8n.pt", help='initial weights path')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--save-period', type=int, default=10, help='Save checkpoint every x epochs')
     return parser.parse_args()
@@ -37,8 +37,8 @@ def main():
         'save_period': args.save_period
     }
 
-    if args.weights:
-        train_args['weights'] = args.weights
+    if args.pretrained:
+        train_args['pretrained'] = args.pretrained
     # 创建cfg对象
     cfg = get_cfg(DEFAULT_CFG, {})  # 创建一个空的配置
 
