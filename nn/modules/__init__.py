@@ -180,4 +180,5 @@ __all__ = (
     "TorchVision",
     "Index",
     "A2C2f",
+    "Adjust_Transformer",
 )
