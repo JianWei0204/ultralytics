@@ -10,8 +10,6 @@ import pandas as pd
 import csv
 import time
 import math
-import numpy as np
-import matplotlib.pyplot as plt
 from datetime import datetime
 from pathlib import Path
 from torch.utils.data import DataLoader
@@ -26,6 +24,7 @@ from ultralytics.utils.loss import v8DetectionLoss
 
 from trans_discriminator import TransformerDiscriminator
 from feature_extractor import FeatureExtractor
+from weight_loader import load_pretrained_weights
 
 
 class DomainAdaptTrainer(DetectionTrainer):
@@ -94,8 +93,22 @@ class DomainAdaptTrainer(DetectionTrainer):
             if hasattr(self, 'save_dir') and self.save_dir:
                 self.original_save_dir = self.save_dir
 
+        # 保存预训练权重路径
+        pretrained_weights = None
+        if hasattr(self.args, 'pretrained') and self.args.pretrained:
+            pretrained_weights = self.args.pretrained
+            # 暂时禁用预训练选项，避免原始加载机制运行
+            self.args.pretrained = ''
+
         # 调用父类的_setup_train来初始化模型和其他组件
         super()._setup_train(world_size)
+
+        # 使用自定义方法加载预训练权重
+        if pretrained_weights:
+            LOGGER.info(f"使用自定义加载器加载预训练权重: {pretrained_weights}")
+            self.model = load_pretrained_weights(self.model, pretrained_weights)
+            # 恢复原始预训练路径
+            self.args.pretrained = pretrained_weights
 
         # 确保后续使用原始保存目录
         if self.original_save_dir is None:
