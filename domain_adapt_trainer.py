@@ -9,6 +9,7 @@ import gc
 import pandas as pd
 import csv
 import time
+import math
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
@@ -253,10 +254,10 @@ class DomainAdaptTrainer(DetectionTrainer):
         # 计算主模型的学习率 - 使用余弦退火策略
         if self.args.cos_lr:
             # 余弦退火学习率
-            self.lf = lambda x: (1 - x / self.epochs) * (1.0 - self.args.lrf) + self.args.lrf  # cosine
+            self.lf = lambda x: max((1 - math.cos(x * math.pi / self.epochs)) / 2, 0) * (self.args.lrf - 1.0) + 1.0 # cosine
         else:
             # 线性学习率
-            self.lf = lambda x: (1 - x / self.epochs) * (1.0 - self.args.lrf) + self.args.lrf  # linear
+            self.lf = lambda x: max(1 - x / self.epochs, 0) * (1.0 - self.args.lrf) + self.args.lrf  # linear
 
         # 计算当前epoch的学习率因子
         lr_factor = self.lf(epoch)
