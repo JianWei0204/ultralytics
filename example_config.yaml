@@ -1,0 +1,23 @@
+mfdam:
+  alignment_weight: 0.4
+  consistency_weight: 0.6
+  da_hidden_dim: 128
+  da_loss_weight: 0.15
+  da_lr: 0.0005
+  da_start_epoch: 8
+  da_weight_decay: 0.0001
+  domain_balance: 0.6
+  domain_weight: 1.2
+  extract_layers:
+  - backbone.9
+  - backbone.12
+  - backbone.15
+  feature_dims:
+  - 256
+  - 512
+  - 1024
+  fusion_dim: 256
+  grl_schedule: true
+  grl_weight: 1.0
+  warmup_epochs: 5
+  weather_weight: 0.8
