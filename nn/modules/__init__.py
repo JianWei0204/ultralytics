@@ -17,6 +17,7 @@ Examples:
     >>> os.system(f"onnxslim {f} {f} && open {f}")  # pip install onnxslim
 """
 from .transLayer import Adjust_Transformer
+from .lightBridge import LightweightDomainAlignBridge
 
 from .block import (
     C1,
@@ -181,4 +182,5 @@ __all__ = (
     "Index",
     "A2C2f",
     "Adjust_Transformer",
+    "LightweightDomainAlignBridge",
 )

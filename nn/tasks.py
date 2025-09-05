@@ -13,6 +13,7 @@ import torch.nn as nn
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
     Adjust_Transformer,
+    LightweightDomainAlignBridge,
     AIFI,
     C1,
     C2,
@@ -1646,6 +1647,7 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             A2C2f,
             Adjust_Transformer,
+            LightweightDomainAlignBridge,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments

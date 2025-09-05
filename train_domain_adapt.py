@@ -8,15 +8,15 @@ from ultralytics.utils import DEFAULT_CFG
 
 def parse_args():
     parser = argparse.ArgumentParser(description='YOLOv8 Domain Adaptation Training')
-    parser.add_argument('--cfg', type=str, default='ultralytics/cfg/models/yolov8-translayer.yaml', help='model.yaml path')
+    parser.add_argument('--cfg', type=str, default='ultralytics/cfg/models/yolov8-translayer2.yaml', help='model.yaml path')
     parser.add_argument('--source-data', type=str, default='/root/autodl-tmp/ultralytics/cfg/datasets/source_dataset.yaml', help='source domain dataset.yaml path')
     parser.add_argument('--target-data', type=str, default='/root/autodl-tmp/ultralytics/cfg/datasets/target_dataset.yaml', help='target domain dataset.yaml path')
     parser.add_argument('--epochs', type=int, default=100, help='number of epochs')
     parser.add_argument('--batch-size', type=int, default=16, help='batch size')
     parser.add_argument('--imgsz', type=int, default=640, help='image size')
     parser.add_argument('--lr0', type=float, default=0.01, help='initial learning rate')
-    parser.add_argument('--disc-lr', type=float, default=0.01, help='initial discriminator learning rate')
-    parser.add_argument('--pretrained', type=str, default="/root/autodl-tmp/ultralytics/yolov8n.pt", help='initial weights path')
+    parser.add_argument('--disc-lr', type=float, default=0.001, help='initial discriminator learning rate')
+    parser.add_argument('--pretrained', type=str, default=None, help='initial weights path')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--save-period', type=int, default=10, help='Save checkpoint every x epochs')
     return parser.parse_args()
